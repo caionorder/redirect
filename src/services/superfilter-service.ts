@@ -1,9 +1,20 @@
 import { BuilderService } from './builder-service';
 import { ProcessService } from './process-service';
+import {
+  IFilterRequest,
+  IFilterParams,
+  IDataItem,
+  IProcessedData,
+  IErrorResponse,
+  IRepository
+} from '../interfaces/filter-interfaces';
 
 export class SuperFilterService {
+  private builderService: BuilderService;
+  private processService: ProcessService;
+
   /**
-   * Inicializa o serviço de filtro super.
+   * Inicializa o serviço de filtro super
    */
   constructor() {
     this.builderService = new BuilderService();
@@ -11,15 +22,14 @@ export class SuperFilterService {
   }
 
   /**
-   * Execute the super filter service.
-   *
-   * @param {Object} request - Objeto com os parâmetros da requisição
-   * @param {Object} repository - Repositório MongoDB
-   * @returns {Promise<Array|Object>} - Dados processados ou objeto de resposta
+   * Execute the super filter service
    */
-  async execute(request, repository) {
+  async execute(
+    request: IFilterRequest,
+    repository: IRepository
+  ): Promise<IProcessedData[] | IErrorResponse> {
     // Verifica se os parâmetros obrigatórios estão presentes
-    const requireParams = ['start', 'end'];
+    const requireParams: (keyof IFilterRequest)[] = ['start', 'end'];
     const missingParams = requireParams.filter(param => !(param in request));
 
     if (missingParams.length > 0) {
@@ -43,13 +53,13 @@ export class SuperFilterService {
 
     // Ordena os dados por revenue
     const sortedData = build.sort((a, b) => {
-      const revenueA = parseFloat(a.revenue || 0);
-      const revenueB = parseFloat(b.revenue || 0);
+      const revenueA = parseFloat(String(a.revenue || 0));
+      const revenueB = parseFloat(String(b.revenue || 0));
       return revenueB - revenueA; // Ordem decrescente
     });
 
     // Processa os dados
-    let processedData;
+    let processedData: IProcessedData[];
     if (filterParams.group && filterParams.group.length > 0) {
       processedData = this.processService.groupData(sortedData, filterParams.group);
     } else {
@@ -61,8 +71,8 @@ export class SuperFilterService {
 
     // Ordena os dados processados por receita
     const resultData = processedData.sort((a, b) => {
-      const revenueA = parseFloat(a.revenue || 0);
-      const revenueB = parseFloat(b.revenue || 0);
+      const revenueA = parseFloat(String(a.revenue || 0));
+      const revenueB = parseFloat(String(b.revenue || 0));
       return revenueB - revenueA; // Ordem decrescente
     });
 
@@ -72,12 +82,9 @@ export class SuperFilterService {
 
   /**
    * Prepara os parâmetros de filtro da requisição
-   *
-   * @param {Object} request - Objeto com os parâmetros da requisição
-   * @returns {Object} - Parâmetros formatados para o BuilderService
    */
-  prepare(request) {
-    const response = {
+  private prepare(request: IFilterRequest): IFilterParams {
+    const response: IFilterParams = {
       network: request.network || null,
       start: request.start || null,
       end: request.end || null,
@@ -97,22 +104,19 @@ export class SuperFilterService {
 
   /**
    * Pré-processa dados de relatório, adicionando campos calculados
-   *
-   * @param {Array<Object>} data - Lista de dados a processar
-   * @returns {Array<Object>} - Lista de dados com campos calculados
    */
-  preResultApi(data) {
-    const newData = [];
+  private preResultApi(data: IProcessedData[]): IProcessedData[] {
+    const newData: IProcessedData[] = [];
 
     for (const item of data) {
       // Cria uma cópia do item para não modificar o original
       const processedItem = { ...item };
 
       // Extrai os valores necessários para os cálculos
-      const revenue = parseFloat(item.revenue || 0);
-      const impressions = parseFloat(item.impressions || 0);
-      const clicks = parseFloat(item.clicks || 0);
-      const revshare = parseFloat(item.revshare || 0);
+      const revenue = parseFloat(String(item.revenue || 0));
+      const impressions = parseFloat(String(item.impressions || 0));
+      const clicks = parseFloat(String(item.clicks || 0));
+      const revshare = parseFloat(String(item.revshare || 0));
 
       // Calcula eCPM
       const ecpm = revenue > 0 && impressions > 0

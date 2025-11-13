@@ -1,19 +1,17 @@
+import { IFilterParams, IMatchStage, IGroupStage, IRepository, IDataItem } from '../interfaces/filter-interfaces';
+
 export class BuilderService {
   /**
    * Constrói e executa uma consulta de agregação complexa baseada nos parâmetros fornecidos
-   *
-   * @param {Object} repository - Repositório para executar a agregação
-   * @param {Object} params - Dicionário com parâmetros de filtro e agrupamento
-   * @returns {Promise<Array>} - Resultados da consulta de agregação
    */
-  async build(repository, params) {
+  async build(repository: IRepository, params: IFilterParams): Promise<IDataItem[]> {
     // Validação de parâmetros obrigatórios
     if (!params.start || !params.end) {
       throw new Error("Parâmetros 'start' e 'end' são obrigatórios");
     }
 
     // Construção do estágio $match dinamicamente
-    const matchStage = {
+    const matchStage: IMatchStage = {
       date: {
         $gte: params.start,
         $lte: params.end
@@ -39,13 +37,17 @@ export class BuilderService {
     }
 
     if (params.custom_value) {
-      let values = params.custom_value;
-      if (typeof values === 'string' && values.includes(',')) {
-        values = values.split(',').map(v => v.trim());
-      } else if (!Array.isArray(values)) {
-        values = [values];
+      let values: string[] = [];
+      if (typeof params.custom_value === 'string' && params.custom_value.includes(',')) {
+        values = params.custom_value.split(',').map(v => v.trim());
+      } else if (Array.isArray(params.custom_value)) {
+        values = params.custom_value;
+      } else if (params.custom_value) {
+        values = [params.custom_value];
       }
-      matchStage.custom_value = { $in: values };
+      if (values.length > 0) {
+        matchStage.custom_value = { $in: values };
+      }
     }
 
     if (params.ad_unit_name) {
@@ -56,7 +58,7 @@ export class BuilderService {
     }
 
     // Pipeline inicial
-    const pipeline = [{ $match: matchStage }];
+    const pipeline: any[] = [{ $match: matchStage }];
 
     // Converte campos para numérico com tratamento de null
     pipeline.push({
@@ -77,7 +79,7 @@ export class BuilderService {
     });
 
     // Constrói o _id do $group
-    const groupId = {};
+    const groupId: Record<string, string> = {};
     if (params.group && params.group.length > 0) {
       params.group.forEach(field => {
         groupId[field] = `$${field}`;
@@ -85,7 +87,7 @@ export class BuilderService {
     }
 
     // Estágio de agrupamento
-    const groupStage = {
+    const groupStage: IGroupStage = {
       $group: {
         _id: groupId,
         impressions: { $sum: '$impressions_int' },
@@ -104,7 +106,7 @@ export class BuilderService {
     pipeline.push(groupStage);
 
     // Configurando a projeção
-    const projectStage = {
+    const projectStage: any = {
       $project: {
         _id: 0,
         impressions: 1,
@@ -182,7 +184,7 @@ export class BuilderService {
     });
 
     // Ordenação
-    let sortField;
+    let sortField: string;
     if (groupId.date) {
       sortField = '_id.date';
     } else if (Object.keys(groupId).length > 0) {
@@ -203,12 +205,10 @@ export class BuilderService {
     // Executando a agregação
     try {
       const results = await repository.query().aggregate(pipeline).toArray();
-      return results;
+      return results as IDataItem[];
     } catch (error) {
       console.error('Erro na agregação:', error);
       throw error;
     }
   }
 }
-
-module.exports = BuilderService;

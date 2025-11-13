@@ -1,31 +1,26 @@
+import { IDataItem, IProcessedData } from '../interfaces/filter-interfaces';
+
 export class ProcessService {
   /**
    * Processa cada item dos dados, formatando-os individualmente
-   *
-   * @param {Array<Object>} data - Lista de objetos com os dados a serem processados
-   * @returns {Array<Object>} - Lista de dados formatados
    */
-  uniqueData(data) {
+  uniqueData(data: IDataItem[]): IProcessedData[] {
     return data.map(item => this.formatDataItem(item));
   }
 
   /**
    * Processa dados agrupados por chaves específicas
-   *
-   * @param {Array<Object>} data - Lista de objetos com os dados a serem processados
-   * @param {Array<string>} groupKeys - Lista de chaves para agrupar os dados
-   * @returns {Array<Object>} - Lista de dados agrupados e formatados
    */
-  groupData(data, groupKeys) {
+  groupData(data: IDataItem[], groupKeys: string[]): IProcessedData[] {
     // Criando um mapa para agrupar os dados
-    const groups = new Map();
+    const groups = new Map<string, IDataItem[]>();
 
     // Agrupando os dados
     data.forEach(item => {
       // Criando a chave de agrupamento
       const groupKey = groupKeys
         .map(key => {
-          const value = item[key];
+          const value = (item as any)[key];
           return value !== null && value !== undefined ? String(value) : 'None';
         })
         .join('#');
@@ -33,11 +28,11 @@ export class ProcessService {
       if (!groups.has(groupKey)) {
         groups.set(groupKey, []);
       }
-      groups.get(groupKey).push(item);
+      groups.get(groupKey)!.push(item);
     });
 
     // Processando cada grupo
-    const result = [];
+    const result: IProcessedData[] = [];
     groups.forEach(group => {
       // Obtendo o primeiro item para os campos de identificação
       const baseFields = this.formatDataItem(group[0], group);
@@ -51,14 +46,14 @@ export class ProcessService {
       ];
 
       // Filtrando apenas os campos desejados
-      const fields = {};
+      const fields: any = {};
       keepFields.forEach(key => {
         if (key in baseFields) {
-          fields[key] = baseFields[key];
+          fields[key] = (baseFields as any)[key];
         }
       });
 
-      result.push(fields);
+      result.push(fields as IProcessedData);
     });
 
     return result;
@@ -66,16 +61,19 @@ export class ProcessService {
 
   /**
    * Formata um item de dados individual ou um grupo de itens
-   *
-   * @param {Object} item - Objeto com o item a ser formatado
-   * @param {Array<Object>} group - Lista de objetos representando um grupo (opcional)
-   * @returns {Object} - Objeto formatado
    */
-  formatDataItem(item, group = null) {
+  private formatDataItem(item: IDataItem, group: IDataItem[] | null = null): IProcessedData {
     const isGroup = group !== null;
 
-    let impressions, elegibleAdRequest, requestsServed, revenue, pmr,
-        unfilledImpressions, clicks, revenueClient, activeView;
+    let impressions: number;
+    let elegibleAdRequest: number;
+    let requestsServed: number;
+    let revenue: number;
+    let pmr: number;
+    let unfilledImpressions: number | null;
+    let clicks: number;
+    let revenueClient: number;
+    let activeView: number;
 
     if (isGroup) {
       // Calcular estatísticas do grupo
@@ -154,7 +152,7 @@ export class ProcessService {
       domain: item.domain,
       domain_id: item.domain_id,
       network: item.network,
-      revshare: item.revshare,
+      revshare: item.revshare ? Number(item.revshare) : undefined,
       hour: item.hour,
       impressions: impressions,
       clicks: clicks,
@@ -177,12 +175,8 @@ export class ProcessService {
 
   /**
    * Soma valores de um campo específico em um array de objetos
-   *
-   * @param {Array<Object>} array - Array de objetos
-   * @param {string} field - Nome do campo a somar
-   * @returns {number} - Soma dos valores
    */
-  sumField(array, field) {
+  private sumField(array: IDataItem[], field: keyof IDataItem): number {
     return array.reduce((sum, item) => {
       const value = item[field];
       return sum + (value !== null && value !== undefined ? Number(value) : 0);
@@ -191,14 +185,8 @@ export class ProcessService {
 
   /**
    * Arredonda um número para um número específico de casas decimais
-   *
-   * @param {number} value - Valor a arredondar
-   * @param {number} decimals - Número de casas decimais
-   * @returns {number} - Valor arredondado
    */
-  round(value, decimals) {
+  private round(value: number, decimals: number): number {
     return Math.round(value * Math.pow(10, decimals)) / Math.pow(10, decimals);
   }
 }
-
-module.exports = ProcessService;
