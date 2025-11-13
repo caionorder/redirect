@@ -8,6 +8,7 @@ import { redis } from './config/redis';
 import { limiter } from './config/rate-limit';
 import { createHealthRouter } from './routes/health-route';
 import { createRedirectRouter } from './routes/redirect-route';
+import { RedirectController } from './controllers/redirect-controller';
 import { errorHandler } from './middleware/error-handler';
 import { Db } from 'mongodb';
 
@@ -75,10 +76,24 @@ export async function createApp(): Promise<Express> {
 
     // Rotas principais da aplicação
     if (db) {
+        // Criar o controller de redirect uma vez
+        const redirectController = new RedirectController(db);
+
+        // IMPORTANTE: Rota raiz "/" executa o redirect diretamente
+        app.get('/', (req, res) => redirectController.redirect(req, res));
+
+        // Montar as rotas em /api
         app.use('/api', createRedirectRouter(db));
     } else {
         // Rota de fallback se não houver DB
         app.use('/api', (_req, res) => {
+            res.status(503).json({
+                error: 'Service temporarily unavailable - Database not connected'
+            });
+        });
+
+        // Fallback para raiz também
+        app.get('/', (_req, res) => {
             res.status(503).json({
                 error: 'Service temporarily unavailable - Database not connected'
             });

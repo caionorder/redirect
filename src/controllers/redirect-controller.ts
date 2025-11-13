@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
 import { Db } from 'mongodb';
+import * as cron from 'node-cron';
 import { SuperFilterService } from '../services/superfilter-service';
 import { GamAdUnitRepository } from '../repositories/gam-ad-unit-repository';
 import { RedirectLinkRepository } from '../repositories/redirect-link-repository';
@@ -32,6 +33,80 @@ export class RedirectController {
             this.redirectLinkRepository = new RedirectLinkRepository(db);
             this.redirectClickRepository = new RedirectClickRepository(db);
         }
+
+        // Inicializar o cron job para executar process a cada hora
+        this.initializeScheduledProcess();
+    }
+
+    /**
+     * Inicializa o agendamento do processo para executar a cada hora
+     */
+    private initializeScheduledProcess(): void {
+        // Agendar para executar no minuto 0 de cada hora (XX:00)
+        const task = cron.schedule('0 * * * *', async () => {
+            console.log('[CRON] Executando process agendado:', new Date().toISOString());
+            try {
+                await this.executeProcessInternal();
+                console.log('[CRON] Process executado com sucesso');
+            } catch (error) {
+                console.error('[CRON] Erro ao executar process agendado:', error);
+            }
+        });
+
+        // Iniciar o cron job
+        task.start();
+        console.log('[CRON] Agendamento do process inicializado - executará a cada hora');
+    }
+
+    /**
+     * Executa o processo internamente (usado pelo cron e endpoint manual)
+     */
+    private async executeProcessInternal(): Promise<any> {
+        const date = new Date();
+        const today = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+        const yesterday = new Date(date.getFullYear(), date.getMonth(), date.getDate() - 1);
+        const custom_key = "id_post_wp";
+        const group = [
+            "domain",
+            "custom_key",
+            "custom_value"
+        ]
+
+        // Converter query para IFilterRequest
+        const filterRequest: IFilterRequest = {
+            start: yesterday.toISOString().split('T')[0],
+            end: today.toISOString().split('T')[0],
+            domain: domains,
+            custom_key: custom_key,
+            group: group
+        };
+
+        // Verificar se o repository existe
+        if (!this.gamAdUnitRepository) {
+            throw new Error('Database not connected');
+        }
+
+        // Executar o filtro usando o GamAdUnitRepository
+        let data = await this.superFilterService.execute(filterRequest, this.gamAdUnitRepository);
+
+        // Top 10 maiores revenues
+        if (data.length > 5) {
+            data.splice(10);
+            const reorderedData = data.sort((a, b) => {
+                const ecpmA = parseFloat(String(a.ecpm || 0));
+                const ecpmB = parseFloat(String(b.ecpm || 0));
+                return ecpmB - ecpmA; // Ordem decrescente
+            });
+            data = reorderedData;
+            data.splice(1);
+        }
+
+        // Se temos dados e redirect link repository, processar links
+        if (Array.isArray(data) && data.length > 0 && this.redirectLinkRepository) {
+            await this.processRedirectLinks(data);
+        }
+
+        return data;
     }
 
     /**
@@ -40,53 +115,14 @@ export class RedirectController {
      */
     public async process(req: Request, res: Response): Promise<void> {
         try {
-            const date = new Date();
-            const today = new Date(date.getFullYear(), date.getMonth(), date.getDate());
-            const yesterday = new Date(date.getFullYear(), date.getMonth(), date.getDate() - 1);
-            const custom_key = "id_post_wp";
-            const group = [
-                "domain",
-                "custom_key",
-                "custom_value"
-            ]
-
-
-            // Converter query para IFilterRequest
-            const filterRequest: IFilterRequest = {
-                start: yesterday.toISOString().split('T')[0],
-                end: today.toISOString().split('T')[0],
-                domain: domains,
-                custom_key: custom_key,
-                group: group
-            };
-
-            // Verificar se o repository existe
-            if (!this.gamAdUnitRepository) {
-                res.status(503).json({ error: 'Database not connected' });
-                return;
-            }
-
-            // Executar o filtro usando o GamAdUnitRepository
-            let data = await this.superFilterService.execute(filterRequest, this.gamAdUnitRepository);
-
-            // Top 10 maiores revenues
-            if (data.length > 5) {
-                data.splice(10);
-                const reorderedData = data.sort((a, b) => {
-                    const ecpmA = parseFloat(String(a.ecpm || 0));
-                    const ecpmB = parseFloat(String(b.ecpm || 0));
-                    return ecpmB - ecpmA; // Ordem decrescente
-                });
-                data = reorderedData;
-                data.splice(1);
-            }
-
-            // Se temos dados e redirect link repository, processar links
-            if (Array.isArray(data) && data.length > 0 && this.redirectLinkRepository) {
-                await this.processRedirectLinks(data);
-            }
-
-            res.status(200).json(data);
+            console.log('[MANUAL] Process executado manualmente via endpoint');
+            const data = await this.executeProcessInternal();
+            res.status(200).json({
+                success: true,
+                message: 'Process executado com sucesso',
+                data: data,
+                nextRun: 'Em 1 hora (agendamento automático)'
+            });
         } catch (error) {
             console.error('Error processing filter:', error);
             res.status(500).json({
