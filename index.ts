@@ -1,5 +1,5 @@
-import { setupCluster } from './src/config/cluster.js';
-import { createApp } from './src/app.js';
+import { setupCluster } from './src/config/cluster';
+import { createApp } from './src/app';
 import dotenv from 'dotenv';
 
 dotenv.config();

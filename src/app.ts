@@ -5,7 +5,7 @@ import helmet from 'helmet';
 import morgan from 'morgan';
 import { connectDB } from './config/database';
 import { redis } from './config/redis';
-import { limiter } from './config/rate-limit';
+//import { limiter } from './config/rate-limit';
 import { createHealthRouter } from './routes/health-route';
 import { createRedirectRouter } from './routes/redirect-route';
 import { RedirectController } from './controllers/redirect-controller';
@@ -45,7 +45,7 @@ export async function createApp(): Promise<Express> {
     app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
     // Rate limiting
-    app.use('/api/', limiter);
+    //app.use('/api/', limiter);
 
     // Conectar ao MongoDB
     let db: Db | undefined;

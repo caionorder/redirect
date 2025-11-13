@@ -17,7 +17,6 @@
   "description": "Redirecto best URL",
   "license": "ISC",
   "author": "Caio Norder",
-  "type": "module",
   "main": "dist/index.js",
   "scripts": {
     "start": "node dist/index.js",

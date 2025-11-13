@@ -18,6 +18,11 @@ COPY . .
 # Copy .env
 COPY .env .env
 
+# Build TypeScript (install dev dependencies temporarily for build)
+RUN npm install --only=dev && \
+    npm run build && \
+    npm prune --production
+
 # Expose the port
 EXPOSE 3000
 
@@ -26,4 +31,4 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
   CMD wget --no-verbose --tries=1 --spider http://localhost:3000/health || exit 1
 
 # Set the command to run the application
-CMD ["sh", "-c", "redis-server --daemonize yes && node index.js"]
+CMD ["sh", "-c", "redis-server --daemonize yes && node dist/index.js"]

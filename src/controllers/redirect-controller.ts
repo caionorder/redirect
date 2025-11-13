@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { Db } from 'mongodb';
 import * as cron from 'node-cron';
+import cluster from 'cluster';
 import { SuperFilterService } from '../services/superfilter-service';
 import { GamAdUnitRepository } from '../repositories/gam-ad-unit-repository';
 import { RedirectLinkRepository } from '../repositories/redirect-link-repository';
@@ -16,6 +17,7 @@ export class RedirectController {
     private gamAdUnitRepository?: GamAdUnitRepository;
     private redirectLinkRepository?: RedirectLinkRepository;
     private redirectClickRepository?: RedirectClickRepository;
+    private redisClient: typeof redis | null;
 
     // Constantes para controle de tráfego
     private readonly TRAFFIC_DISTRIBUTION = {
@@ -27,6 +29,7 @@ export class RedirectController {
     constructor(db?: Db) {
         this.db = db;
         this.superFilterService = new SuperFilterService();
+        this.redisClient = redis;
 
         if (db) {
             this.gamAdUnitRepository = new GamAdUnitRepository(db);
@@ -34,8 +37,15 @@ export class RedirectController {
             this.redirectClickRepository = new RedirectClickRepository(db);
         }
 
-        // Inicializar o cron job para executar process a cada hora
-        this.initializeScheduledProcess();
+        // IMPORTANTE: Inicializar o cron job APENAS em UM processo
+        // Para evitar execução duplicada em modo cluster
+        const isMainProcess = !cluster.isWorker || cluster.worker?.id === 1;
+
+        if (isMainProcess) {
+            this.initializeScheduledProcess();
+        } else {
+            console.log(`[CRON] Skipping cron initialization for worker ${cluster.worker?.id}`);
+        }
     }
 
     /**
@@ -89,16 +99,19 @@ export class RedirectController {
         // Executar o filtro usando o GamAdUnitRepository
         let data = await this.superFilterService.execute(filterRequest, this.gamAdUnitRepository);
 
-        // Top 10 maiores revenues
-        if (data.length > 5) {
-            data.splice(10);
-            const reorderedData = data.sort((a, b) => {
-                const ecpmA = parseFloat(String(a.ecpm || 0));
-                const ecpmB = parseFloat(String(b.ecpm || 0));
-                return ecpmB - ecpmA; // Ordem decrescente
-            });
-            data = reorderedData;
-            data.splice(1);
+        // Verificar se é um array (não um erro)
+        if (Array.isArray(data)) {
+            // Top 10 maiores revenues
+            if (data.length > 5) {
+                data.splice(10);
+                const reorderedData = data.sort((a, b) => {
+                    const ecpmA = parseFloat(String(a.ecpm || 0));
+                    const ecpmB = parseFloat(String(b.ecpm || 0));
+                    return ecpmB - ecpmA; // Ordem decrescente
+                });
+                data = reorderedData;
+                data.splice(1);
+            }
         }
 
         // Se temos dados e redirect link repository, processar links
@@ -305,7 +318,7 @@ export class RedirectController {
             utmParams.append('utm_medium', utmMedium);
 
             // utm_campaign: usar o da request ou o link_id como padrão
-            const utmCampaign = (req.query.utm_campaign as string) || linkId;
+            const utmCampaign = (req.query.utm_campaign as string) || linkId || 'direct';
             utmParams.append('utm_campaign', utmCampaign);
 
             // Adicionar os parâmetros UTM à URL final
