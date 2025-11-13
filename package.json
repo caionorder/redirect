@@ -1,0 +1,37 @@
+{
+  "dependencies": {
+    "compression": "^1.8.1",
+    "cors": "^2.8.5",
+    "dotenv": "^16.6.1",
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.4.1",
+    "helmet": "^8.0.0",
+    "ioredis": "^5.4.1",
+    "mongodb": "^6.10.0",
+    "morgan": "^1.10.0"
+  },
+  "name": "redirect",
+  "version": "1.0.0",
+  "description": "Redirecto best URL",
+  "license": "ISC",
+  "author": "Caio Norder",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "start": "node dist/index.js",
+    "start:prod": "NODE_ENV=production node dist/index.js",
+    "dev": "NODE_ENV=development tsx watch index.ts",
+    "dev:win": "set NODE_ENV=development && tsx watch index.ts",
+    "build": "tsc",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "devDependencies": {
+    "@types/compression": "^1.7.5",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.5",
+    "@types/morgan": "^1.9.9",
+    "@types/node": "^24.10.1",
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.3"
+  }
+}
