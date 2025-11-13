@@ -26,5 +26,10 @@ export function createRedirectRouter(db?: Db): Router {
     controller.getDistinctValues(req, res)
   );
 
+  // Rota para listar links de redirecionamento
+  router.get('/links', (req, res) =>
+    controller.getRedirectLinks(req, res)
+  );
+
   return router;
 }
