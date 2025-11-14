@@ -84,7 +84,7 @@ export class RedirectController {
 
         // Converter query para IFilterRequest
         const filterRequest: IFilterRequest = {
-            start: yesterday.toISOString().split('T')[0],
+            start: today.toISOString().split('T')[0],
             end: today.toISOString().split('T')[0],
             domain: domains,
             custom_key: custom_key,
