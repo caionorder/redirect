@@ -21,9 +21,9 @@ export async function createApp(): Promise<Express> {
     app.disable('x-powered-by');
     app.set('etag', false);
 
-    // Logging
+    // Logging - formato simplificado
     if (process.env.NODE_ENV !== 'test') {
-        app.use(morgan('combined'));
+        app.use(morgan('[UTM REQUEST] :method :url'));
     }
 
     // Compressão

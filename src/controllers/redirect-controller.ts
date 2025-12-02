@@ -62,10 +62,9 @@ export class RedirectController {
 
     /**
      * Executa o processo internamente (usado pelo cron e endpoint manual)
-     * Busca dados do SuperFilter para o domínio da PRÓXIMA hora
-     * e configura o link com melhor eCPM (60%) + random (40%)
+     * @param forNextHour - se true, processa para próxima hora (usado pelo cron); se false, processa hora atual
      */
-    private async executeProcessInternal(): Promise<any> {
+    private async executeProcessInternal(forNextHour: boolean = true): Promise<any> {
         const date = new Date();
         const today = new Date(date.getFullYear(), date.getMonth(), date.getDate());
         const custom_key = "id_post_wp";
@@ -75,8 +74,8 @@ export class RedirectController {
             "custom_value"
         ];
 
-        // Obter o domínio da PRÓXIMA hora (pois o cron roda no minuto 59)
-        const targetDomain = getDomainForNextHour();
+        // Obter o domínio baseado no parâmetro
+        const targetDomain = forNextHour ? getDomainForNextHour() : getDomainForCurrentHour();
 
         // Converter query para IFilterRequest - filtra apenas pelo domínio da próxima hora
         const filterRequest: IFilterRequest = {
@@ -122,12 +121,13 @@ export class RedirectController {
      */
     public async process(req: Request, res: Response): Promise<void> {
         try {
-            const data = await this.executeProcessInternal();
+            // Processa para a hora ATUAL (não próxima hora)
+            const data = await this.executeProcessInternal(false);
+            const currentDomain = getDomainForCurrentHour();
             res.status(200).json({
                 success: true,
-                message: 'Process executado com sucesso',
-                data: data,
-                nextRun: 'Em 1 hora (agendamento automático)'
+                message: `Process executado para hora atual - Domínio: ${currentDomain}`,
+                data: data
             });
         } catch (error) {
             console.error('Error processing filter:', error);
