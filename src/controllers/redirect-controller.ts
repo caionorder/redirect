@@ -8,8 +8,7 @@ import { RedirectLinkRepository } from '../repositories/redirect-link-repository
 import { RedirectClickRepository } from '../repositories/redirect-click-repository';
 import { IFilterRequest } from '../interfaces/filter-interfaces';
 import { redis } from '../config/redis';
-import { getActiveFallbackDomains, generateRandomPath } from '../config/domains';
-import { domains } from '../config/domains';
+import { generateRandomPath, getDomainForCurrentHour, getDomainForNextHour } from '../config/domains';
 
 export class RedirectController {
     private db?: Db;
@@ -43,50 +42,47 @@ export class RedirectController {
 
         if (isMainProcess) {
             this.initializeScheduledProcess();
-        } else {
-            console.log(`[CRON] Skipping cron initialization for worker ${cluster.worker?.id}`);
         }
     }
 
     /**
-     * Inicializa o agendamento do processo para executar a cada hora
+     * Inicializa o agendamento do processo para executar no último minuto de cada hora
+     * Isso garante que os dados estejam prontos para a próxima hora
      */
     private initializeScheduledProcess(): void {
-        // Agendar para executar no minuto 0 de cada hora (XX:00)
-        const task = cron.schedule('0 * * * *', async () => {
-            console.log('[CRON] Executando process agendado:', new Date().toISOString());
+        const task = cron.schedule('59 * * * *', async () => {
             try {
                 await this.executeProcessInternal();
-                console.log('[CRON] Process executado com sucesso');
             } catch (error) {
-                console.error('[CRON] Erro ao executar process agendado:', error);
+                console.error('[CRON] Erro:', error);
             }
         });
-
-        // Iniciar o cron job
         task.start();
-        console.log('[CRON] Agendamento do process inicializado - executará a cada hora');
     }
 
     /**
      * Executa o processo internamente (usado pelo cron e endpoint manual)
+     * Busca dados do SuperFilter para o domínio da PRÓXIMA hora
+     * e configura o link com melhor eCPM (60%) + random (40%)
      */
     private async executeProcessInternal(): Promise<any> {
         const date = new Date();
         const today = new Date(date.getFullYear(), date.getMonth(), date.getDate());
-        const yesterday = new Date(date.getFullYear(), date.getMonth(), date.getDate() - 1);
         const custom_key = "id_post_wp";
         const group = [
             "domain",
             "custom_key",
             "custom_value"
-        ]
+        ];
 
-        // Converter query para IFilterRequest
+        // Obter o domínio da PRÓXIMA hora (pois o cron roda no minuto 59)
+        const targetDomain = getDomainForNextHour();
+
+        // Converter query para IFilterRequest - filtra apenas pelo domínio da próxima hora
         const filterRequest: IFilterRequest = {
             start: today.toISOString().split('T')[0],
             end: today.toISOString().split('T')[0],
-            domain: domains,
+            domain: targetDomain, // Apenas o domínio da próxima hora
             custom_key: custom_key,
             group: group
         };
@@ -101,22 +97,20 @@ export class RedirectController {
 
         // Verificar se é um array (não um erro)
         if (Array.isArray(data)) {
-            // Top 10 maiores revenues
-            if (data.length > 5) {
-                data.splice(10);
+            // Ordenar por eCPM decrescente e pegar o melhor resultado
+            if (data.length > 0) {
                 const reorderedData = data.sort((a, b) => {
                     const ecpmA = parseFloat(String(a.ecpm || 0));
                     const ecpmB = parseFloat(String(b.ecpm || 0));
                     return ecpmB - ecpmA; // Ordem decrescente
                 });
-                data = reorderedData;
-                data.splice(1);
+                data = [reorderedData[0]];
             }
         }
 
-        // Se temos dados e redirect link repository, processar links
+        // Se temos dados e redirect link repository, processar links para o domínio da próxima hora
         if (Array.isArray(data) && data.length > 0 && this.redirectLinkRepository) {
-            await this.processRedirectLinks(data);
+            await this.processRedirectLinksForHour(data, targetDomain);
         }
 
         return data;
@@ -128,7 +122,6 @@ export class RedirectController {
      */
     public async process(req: Request, res: Response): Promise<void> {
         try {
-            console.log('[MANUAL] Process executado manualmente via endpoint');
             const data = await this.executeProcessInternal();
             res.status(200).json({
                 success: true,
@@ -146,28 +139,23 @@ export class RedirectController {
     }
 
     /**
-     * Processa os dados para criar/atualizar redirect links
+     * Processa os dados para criar/atualizar redirect links para um domínio específico (por hora)
+     * Mantém apenas o link com melhor eCPM ativo para o domínio
      */
-    private async processRedirectLinks(data: any[]): Promise<void> {
+    private async processRedirectLinksForHour(data: any[], targetDomain: string): Promise<void> {
         if (!this.redirectLinkRepository) return;
 
         try {
-            // Primeiro, desativar todos os links existentes dos domínios processados
-            const domainsInData = [...new Set(data.map(item => item.domain).filter(Boolean))];
+            // Desativar todos os links existentes do domínio alvo
+            const existingLinks = await this.redirectLinkRepository.getLinksByDomain(targetDomain);
 
-            for (const domain of domainsInData) {
-                // Buscar todos os links do domínio
-                const existingLinks = await this.redirectLinkRepository.getLinksByDomain(domain);
-
-                // Desativar todos
-                for (const link of existingLinks) {
-                    if (link._id) {
-                        await this.redirectLinkRepository.updateLink(link._id.toString(), { status: false });
-                    }
+            for (const link of existingLinks) {
+                if (link._id) {
+                    await this.redirectLinkRepository.updateLink(link._id.toString(), { status: false });
                 }
             }
 
-            // Processar cada item de dados para criar/atualizar redirect links
+            // Processar o item com melhor eCPM (já vem apenas 1 do executeProcessInternal)
             for (const item of data) {
                 if (item.domain && item.custom_value) {
                     // Construir URL de redirecionamento: domain?p=custom_value
@@ -177,12 +165,10 @@ export class RedirectController {
                     const existingLink = await this.redirectLinkRepository.getLinkByDomainAndUrl(item.domain, redirectUrl);
 
                     if (existingLink && existingLink._id) {
-                        // Atualizar link existente para ativo
                         await this.redirectLinkRepository.updateLink(existingLink._id.toString(), {
                             status: true
                         });
                     } else {
-                        // Criar novo link
                         await this.redirectLinkRepository.createLink({
                             domain: item.domain,
                             url: redirectUrl,
@@ -192,7 +178,7 @@ export class RedirectController {
                 }
             }
         } catch (error) {
-            console.error('Error processing redirect links:', error);
+            console.error('Error processing redirect links for hour:', error);
         }
     }
 
@@ -232,21 +218,10 @@ export class RedirectController {
                 const wasRecent = await this.redisClient.get(recentKey);
 
                 if (wasRecent) {
-                    console.log(`[DUPLICATE REQUEST] Ignoring duplicate from ${clientIp}`);
-                    // Redirecionar para o mesmo lugar sem contar novamente
-                    const lastUrl = wasRecent;
-                    res.redirect(lastUrl);
+                    res.redirect(wasRecent);
                     return;
                 }
             }
-
-            // Log da requisição para debug
-            console.log(`[REDIRECT REQUEST]`, {
-                path: req.path,
-                clientIp: clientIp,
-                originalQuery: Object.keys(req.query).length > 0 ? req.query : 'none',
-                cleanQuery: Object.keys(cleanQuery).length > 0 ? cleanQuery : 'none'
-            });
 
             // Incrementar e obter contador
             const counter = await this.getAndIncrementCounter();
@@ -254,56 +229,41 @@ export class RedirectController {
             // Calcular posição no ciclo (1-10)
             const cyclePosition = ((counter - 1) % 10) + 1;
 
-            // Determinar se deve usar link do banco (60%) ou fallback (40%)
+            // Obter o domínio da hora atual
+            const currentHourDomain = getDomainForCurrentHour();
+
+            // Determinar se deve usar link do banco (60%) ou random (40%)
             const usePrimaryLink = cyclePosition <= this.TRAFFIC_DISTRIBUTION.PRIMARY;
 
             let redirectUrl: string | null = null;
             let linkId: string | null = null;
 
             if (usePrimaryLink) {
-                // Posições 1-6: Tentar usar links do banco
+                // Posições 1-6 (60%): Usar link com melhor eCPM do domínio da hora atual
                 if (this.redirectLinkRepository) {
-                    const activeLink = await this.getActiveRedirectLinkWithId();
+                    const activeLink = await this.getActiveRedirectLinkForDomain(currentHourDomain);
 
                     if (activeLink) {
                         redirectUrl = activeLink.url;
                         linkId = activeLink.id;
-                        console.log(`[USING DB LINK] Position ${cyclePosition}: ${redirectUrl}`);
+                        console.log(`[60% LINK] ${redirectUrl}`);
                     } else {
-                        // Não há links ativos no banco, usar fallback padrão
-                        redirectUrl = `https://${domains[0]}${generateRandomPath()}`;
-                        linkId = `fallback_no_active_links`;
-                        console.log(`[NO ACTIVE LINKS] Position ${cyclePosition}: Using default fallback`);
+                        redirectUrl = `https://${currentHourDomain}${generateRandomPath()}`;
+                        linkId = `fallback_no_active_${currentHourDomain}`;
+                        console.log(`[60% LINK] ${redirectUrl}`);
                     }
                 }
             } else {
-                // Posições 7-10: Usar fallback domains sequencialmente
-                const domainIndex = cyclePosition - 7; // 7->0, 8->1, 9->2, 10->3
-
-                if (domainIndex >= 0 && domainIndex < domains.length) {
-                    redirectUrl = `https://${domains[domainIndex]}${generateRandomPath()}`;
-                    linkId = `fallback_${domains[domainIndex]}`;
-                    console.log(`[USING FALLBACK] Position ${cyclePosition}: Domain ${domains[domainIndex]}`);
-                } else {
-                    // Fallback de segurança (não deveria acontecer)
-                    redirectUrl = `https://${domains[0]}${generateRandomPath()}`;
-                    linkId = `fallback_error`;
-                    console.log(`[ERROR] Invalid domain index: ${domainIndex}`);
-                }
+                // Posições 7-10 (40%): Usar domínio da hora atual + /random
+                redirectUrl = `https://${currentHourDomain}${generateRandomPath()}`;
+                linkId = `random_${currentHourDomain}`;
+                console.log(`[40% LINK] ${redirectUrl}`);
             }
 
             // Garantir que sempre temos uma URL válida
             if (!redirectUrl) {
                 redirectUrl = 'https://useuapp.com/random';
                 linkId = 'fallback_emergency';
-                console.error('[EMERGENCY] No redirect URL available!');
-            }
-
-            // Verificar se vamos realmente fazer o redirect antes de contar
-            if (!redirectUrl) {
-                console.error('[ERROR] No redirect URL available, aborting!');
-                res.status(500).json({ error: 'No redirect URL available' });
-                return;
             }
 
             // Preparar parâmetros UTM para adicionar à URL
@@ -325,39 +285,18 @@ export class RedirectController {
             const separator = redirectUrl.includes('?') ? '&' : '?';
             const finalRedirectUrl = `${redirectUrl}${separator}${utmParams.toString()}`;
 
-            // Registrar o click SOMENTE se temos URL e ID válidos
-            if (linkId && redirectUrl && this.redirectClickRepository) {
-                try {
-                    const clickResult = await this.redirectClickRepository.incrementClick(linkId);
-                    console.log(`[CLICK RECORDED] LinkID: ${linkId}, New Count: ${clickResult.count}`);
-                } catch (error) {
-                    console.error('[ERROR] Failed to record click:', error);
-                    // Continua com o redirect mesmo se falhar ao registrar o click
-                }
+            // Registrar o click
+            if (linkId && this.redirectClickRepository) {
+                this.redirectClickRepository.incrementClick(linkId)
+                    .then(result => console.log(`[CLICK RECORDED] LinkID: ${linkId}, New Count: ${result.count}`))
+                    .catch(() => {});
             }
 
             // Salvar no cache para evitar duplicação (TTL de 5 segundos)
-            if (this.redisClient && requestKey) {
-                const recentKey = `recent:${requestKey}`;
-                await this.redisClient.set(recentKey, finalRedirectUrl, 'EX', 5);
+            if (this.redisClient) {
+                await this.redisClient.set(`recent:${requestKey}`, finalRedirectUrl, 'EX', 5);
             }
 
-            // Log final antes do redirect
-            console.log(`[REDIRECT FINAL]`, {
-                counter,
-                cyclePosition,
-                usePrimaryLink,
-                linkId,
-                originalUrl: redirectUrl,
-                finalUrl: finalRedirectUrl,
-                utmParams: {
-                    source: utmSource,
-                    medium: utmMedium,
-                    campaign: utmCampaign
-                }
-            });
-
-            // Executar o redirect com os parâmetros UTM
             res.redirect(finalRedirectUrl);
         } catch (error) {
             console.error('Error in redirect:', error);
@@ -388,50 +327,28 @@ export class RedirectController {
     }
 
     /**
-     * Obtém um link de redirecionamento ativo do banco
+     * Obtém o link ativo para um domínio específico (usado na lógica de hora)
+     * Retorna o link com melhor eCPM que foi definido pelo cron
      */
-    private async getActiveRedirectLink(): Promise<string | null> {
+    private async getActiveRedirectLinkForDomain(domain: string): Promise<{ url: string; id: string } | null> {
         if (!this.redirectLinkRepository) return null;
 
         try {
-            // Buscar todos os links ativos
-            const activeLinks = await this.redirectLinkRepository.getAllLinks(100, 0);
-            const activeLinksList = activeLinks.filter(link => link.status === true);
+            // Buscar links ativos do domínio específico
+            const domainLinks = await this.redirectLinkRepository.getLinksByDomain(domain);
+            const activeLinks = domainLinks.filter(link => link.status === true);
 
-            if (activeLinksList.length === 0) return null;
+            if (activeLinks.length === 0) return null;
 
-            // Escolher um link aleatório dos ativos
-            const randomIndex = Math.floor(Math.random() * activeLinksList.length);
-            return activeLinksList[randomIndex].url;
-        } catch (error) {
-            console.error('Error getting active redirect link:', error);
-            return null;
-        }
-    }
-
-    /**
-     * Obtém um link de redirecionamento ativo do banco com ID
-     */
-    private async getActiveRedirectLinkWithId(): Promise<{ url: string; id: string } | null> {
-        if (!this.redirectLinkRepository) return null;
-
-        try {
-            // Buscar todos os links ativos
-            const activeLinks = await this.redirectLinkRepository.getAllLinks(100, 0);
-            const activeLinksList = activeLinks.filter(link => link.status === true);
-
-            if (activeLinksList.length === 0) return null;
-
-            // Escolher um link aleatório dos ativos
-            const randomIndex = Math.floor(Math.random() * activeLinksList.length);
-            const selectedLink = activeLinksList[randomIndex];
+            // Retorna o primeiro link ativo (deve ser único por domínio após o processamento do cron)
+            const selectedLink = activeLinks[0];
 
             return {
                 url: selectedLink.url,
                 id: selectedLink._id?.toString() || ''
             };
         } catch (error) {
-            console.error('Error getting active redirect link with ID:', error);
+            console.error(`Error getting active redirect link for domain ${domain}:`, error);
             return null;
         }
     }
