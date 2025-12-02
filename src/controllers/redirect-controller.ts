@@ -177,6 +177,11 @@ export class RedirectController {
                     }
                 }
             }
+
+            // Invalidar cache do domínio para forçar nova busca
+            if (this.redisClient) {
+                await this.redisClient.del(`active_link:${targetDomain}`);
+            }
         } catch (error) {
             console.error('Error processing redirect links for hour:', error);
         }
@@ -328,25 +333,40 @@ export class RedirectController {
 
     /**
      * Obtém o link ativo para um domínio específico (usado na lógica de hora)
-     * Retorna o link com melhor eCPM que foi definido pelo cron
+     * Usa cache Redis para evitar queries repetidas ao MongoDB
      */
     private async getActiveRedirectLinkForDomain(domain: string): Promise<{ url: string; id: string } | null> {
-        if (!this.redirectLinkRepository) return null;
+        const cacheKey = `active_link:${domain}`;
 
         try {
-            // Buscar links ativos do domínio específico
+            // Tentar buscar do cache primeiro
+            if (this.redisClient) {
+                const cached = await this.redisClient.get(cacheKey);
+                if (cached) {
+                    return JSON.parse(cached);
+                }
+            }
+
+            // Se não tem cache, buscar do banco
+            if (!this.redirectLinkRepository) return null;
+
             const domainLinks = await this.redirectLinkRepository.getLinksByDomain(domain);
             const activeLinks = domainLinks.filter(link => link.status === true);
 
             if (activeLinks.length === 0) return null;
 
-            // Retorna o primeiro link ativo (deve ser único por domínio após o processamento do cron)
             const selectedLink = activeLinks[0];
-
-            return {
+            const result = {
                 url: selectedLink.url,
                 id: selectedLink._id?.toString() || ''
             };
+
+            // Salvar no cache por 1 hora (3600 segundos)
+            if (this.redisClient) {
+                await this.redisClient.set(cacheKey, JSON.stringify(result), 'EX', 3600);
+            }
+
+            return result;
         } catch (error) {
             console.error(`Error getting active redirect link for domain ${domain}:`, error);
             return null;
