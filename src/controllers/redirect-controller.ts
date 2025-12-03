@@ -8,25 +8,24 @@ import { RedirectLinkRepository } from '../repositories/redirect-link-repository
 import { RedirectClickRepository } from '../repositories/redirect-click-repository';
 import { IFilterRequest } from '../interfaces/filter-interfaces';
 import { redis } from '../config/redis';
-import { generateRandomPath, getDomainForCurrentHour, getDomainForNextHour } from '../config/domains';
+import { generateRandomPath, domains } from '../config/domains';
 
 export class RedirectController {
-    private db?: Db;
     private superFilterService: SuperFilterService;
     private gamAdUnitRepository?: GamAdUnitRepository;
     private redirectLinkRepository?: RedirectLinkRepository;
     private redirectClickRepository?: RedirectClickRepository;
     private redisClient: typeof redis | null;
 
-    // Constantes para controle de tráfego
     private readonly TRAFFIC_DISTRIBUTION = {
-        PRIMARY: 6,  // 60% do tráfego vai para links do banco
-        FALLBACK: 4  // 40% do tráfego vai para domínios de fallback
+        PRIMARY: 6,  // 60% do tráfego vai para o melhor link
+        FALLBACK: 4  // 40% do tráfego vai para domínios /random
     };
     private readonly COUNTER_KEY = 'redirect:traffic:counter';
+    private readonly FALLBACK_COUNTER_KEY = 'redirect:fallback:counter';
+    private readonly BEST_LINK_CACHE_KEY = 'redirect:best_link';
 
     constructor(db?: Db) {
-        this.db = db;
         this.superFilterService = new SuperFilterService();
         this.redisClient = redis;
 
@@ -36,21 +35,17 @@ export class RedirectController {
             this.redirectClickRepository = new RedirectClickRepository(db);
         }
 
-        // IMPORTANTE: Inicializar o cron job APENAS em UM processo
-        // Para evitar execução duplicada em modo cluster
         const isMainProcess = !cluster.isWorker || cluster.worker?.id === 1;
-
         if (isMainProcess) {
             this.initializeScheduledProcess();
         }
     }
 
     /**
-     * Inicializa o agendamento do processo para executar no último minuto de cada hora
-     * Isso garante que os dados estejam prontos para a próxima hora
+     * Cron: minuto 30 de cada hora - busca melhor eCPM geral
      */
     private initializeScheduledProcess(): void {
-        const task = cron.schedule('59 * * * *', async () => {
+        const task = cron.schedule('30 * * * *', async () => {
             try {
                 await this.executeProcessInternal();
             } catch (error) {
@@ -61,72 +56,99 @@ export class RedirectController {
     }
 
     /**
-     * Executa o processo internamente (usado pelo cron e endpoint manual)
-     * @param forNextHour - se true, processa para próxima hora (usado pelo cron); se false, processa hora atual
+     * Busca em TODOS os domínios o post com maior eCPM e salva no cache
      */
-    private async executeProcessInternal(forNextHour: boolean = true): Promise<any> {
+    private async executeProcessInternal(): Promise<any> {
         const date = new Date();
         const today = new Date(date.getFullYear(), date.getMonth(), date.getDate());
-        const custom_key = "id_post_wp";
-        const group = [
-            "domain",
-            "custom_key",
-            "custom_value"
-        ];
 
-        // Obter o domínio baseado no parâmetro
-        const targetDomain = forNextHour ? getDomainForNextHour() : getDomainForCurrentHour();
-
-        // Converter query para IFilterRequest - filtra apenas pelo domínio da próxima hora
         const filterRequest: IFilterRequest = {
             start: today.toISOString().split('T')[0],
             end: today.toISOString().split('T')[0],
-            domain: targetDomain, // Apenas o domínio da próxima hora
-            custom_key: custom_key,
-            group: group
+            domain: domains, // TODOS os domínios
+            custom_key: "id_post_wp",
+            group: ["domain", "custom_key", "custom_value"]
         };
 
-        // Verificar se o repository existe
         if (!this.gamAdUnitRepository) {
             throw new Error('Database not connected');
         }
 
-        // Executar o filtro usando o GamAdUnitRepository
         let data = await this.superFilterService.execute(filterRequest, this.gamAdUnitRepository);
 
-        // Verificar se é um array (não um erro)
-        if (Array.isArray(data)) {
-            // Ordenar por eCPM decrescente e pegar o melhor resultado
-            if (data.length > 0) {
-                const reorderedData = data.sort((a, b) => {
-                    const ecpmA = parseFloat(String(a.ecpm || 0));
-                    const ecpmB = parseFloat(String(b.ecpm || 0));
-                    return ecpmB - ecpmA; // Ordem decrescente
-                });
-                data = [reorderedData[0]];
+        if (Array.isArray(data) && data.length > 0) {
+            // Ordenar por eCPM e pegar o MELHOR de todos os domínios
+            const sorted = data.sort((a, b) => {
+                const ecpmA = parseFloat(String(a.ecpm || 0));
+                const ecpmB = parseFloat(String(b.ecpm || 0));
+                return ecpmB - ecpmA;
+            });
+
+            const best = sorted[0];
+            if (best.domain && best.custom_value) {
+                const bestLink = {
+                    url: `https://${best.domain}/?p=${encodeURIComponent(String(best.custom_value))}`,
+                    domain: best.domain,
+                    ecpm: best.ecpm
+                };
+
+                // Salvar no cache Redis (1 hora)
+                if (this.redisClient) {
+                    await this.redisClient.set(this.BEST_LINK_CACHE_KEY, JSON.stringify(bestLink), 'EX', 3600);
+                }
+
+                // Atualizar no banco também
+                if (this.redirectLinkRepository) {
+                    await this.updateBestLink(bestLink);
+                }
+
+                return bestLink;
             }
         }
 
-        // Se temos dados e redirect link repository, processar links para o domínio da próxima hora
-        if (Array.isArray(data) && data.length > 0 && this.redirectLinkRepository) {
-            await this.processRedirectLinksForHour(data, targetDomain);
-        }
-
-        return data;
+        return null;
     }
 
     /**
-     * Processa requisições de filtro/analytics e cria/atualiza redirect links
-     * Endpoint: GET /api/process
+     * Atualiza o link no banco de dados
      */
-    public async process(req: Request, res: Response): Promise<void> {
+    private async updateBestLink(bestLink: { url: string; domain: string }): Promise<void> {
+        if (!this.redirectLinkRepository) return;
+
         try {
-            // Processa para a hora ATUAL (não próxima hora)
-            const data = await this.executeProcessInternal(false);
-            const currentDomain = getDomainForCurrentHour();
+            // Desativar todos os links
+            const allLinks = await this.redirectLinkRepository.getAllLinks(1000, 0);
+            for (const link of allLinks) {
+                if (link._id && link.status) {
+                    await this.redirectLinkRepository.updateLink(link._id.toString(), { status: false });
+                }
+            }
+
+            // Ativar ou criar o melhor link
+            const existing = await this.redirectLinkRepository.getLinkByDomainAndUrl(bestLink.domain, bestLink.url);
+            if (existing && existing._id) {
+                await this.redirectLinkRepository.updateLink(existing._id.toString(), { status: true });
+            } else {
+                await this.redirectLinkRepository.createLink({
+                    domain: bestLink.domain,
+                    url: bestLink.url,
+                    status: true
+                });
+            }
+        } catch (error) {
+            console.error('Error updating best link:', error);
+        }
+    }
+
+    /**
+     * Endpoint manual: GET /api/process
+     */
+    public async process(_req: Request, res: Response): Promise<void> {
+        try {
+            const data = await this.executeProcessInternal();
             res.status(200).json({
                 success: true,
-                message: `Process executado para hora atual - Domínio: ${currentDomain}`,
+                message: 'Process executado - melhor eCPM geral encontrado',
                 data: data
             });
         } catch (error) {
@@ -139,71 +161,20 @@ export class RedirectController {
     }
 
     /**
-     * Processa os dados para criar/atualizar redirect links para um domínio específico (por hora)
-     * Mantém apenas o link com melhor eCPM ativo para o domínio
-     */
-    private async processRedirectLinksForHour(data: any[], targetDomain: string): Promise<void> {
-        if (!this.redirectLinkRepository) return;
-
-        try {
-            // Desativar todos os links existentes do domínio alvo
-            const existingLinks = await this.redirectLinkRepository.getLinksByDomain(targetDomain);
-
-            for (const link of existingLinks) {
-                if (link._id) {
-                    await this.redirectLinkRepository.updateLink(link._id.toString(), { status: false });
-                }
-            }
-
-            // Processar o item com melhor eCPM (já vem apenas 1 do executeProcessInternal)
-            for (const item of data) {
-                if (item.domain && item.custom_value) {
-                    // Construir URL de redirecionamento: domain?p=custom_value
-                    const redirectUrl = `https://${item.domain}/?p=${encodeURIComponent(item.custom_value)}`;
-
-                    // Verificar se já existe um link para este domain/url
-                    const existingLink = await this.redirectLinkRepository.getLinkByDomainAndUrl(item.domain, redirectUrl);
-
-                    if (existingLink && existingLink._id) {
-                        await this.redirectLinkRepository.updateLink(existingLink._id.toString(), {
-                            status: true
-                        });
-                    } else {
-                        await this.redirectLinkRepository.createLink({
-                            domain: item.domain,
-                            url: redirectUrl,
-                            status: true
-                        });
-                    }
-                }
-            }
-
-            // Invalidar cache do domínio para forçar nova busca
-            if (this.redisClient) {
-                await this.redisClient.del(`active_link:${targetDomain}`);
-            }
-        } catch (error) {
-            console.error('Error processing redirect links for hour:', error);
-        }
-    }
-
-    /**
-     * Processa redirecionamentos com distribuição de tráfego 60/40
-     * Endpoint: GET /api/redirect
+     * Redirect principal com distribuição 60/40
+     * 60% -> melhor link (eCPM)
+     * 40% -> /random rotacionando domínios sequencialmente
      */
     public async redirect(req: Request, res: Response): Promise<void> {
         try {
-            // Ignorar requisições de favicon e outras não relacionadas
             if (req.path.includes('favicon') || req.url.includes('favicon')) {
                 res.status(204).end();
                 return;
             }
 
-            // Listar parâmetros ignorados (tracking, analytics, etc)
             const ignoredParams = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
                                   'fbclid', 'gclid', 'msclkid', 'ref', 'referrer', '_ga', '_gid'];
 
-            // Filtrar query params, removendo os ignorados
             const cleanQuery: Record<string, any> = {};
             for (const [key, value] of Object.entries(req.query)) {
                 if (!ignoredParams.includes(key) && !key.startsWith('utm_')) {
@@ -211,93 +182,81 @@ export class RedirectController {
                 }
             }
 
-            // Criar uma chave única para a requisição (baseada em IP + path + query limpa)
             const clientIp = (req.headers['x-forwarded-for'] as string)?.split(',')[0] ||
-                           req.socket.remoteAddress ||
-                           'unknown';
+                           req.socket.remoteAddress || 'unknown';
             const requestKey = `${clientIp}_${req.path}_${JSON.stringify(cleanQuery)}`;
 
-            // Verificar se essa requisição já foi processada recentemente (anti-duplicação)
+            // Anti-duplicação
             if (this.redisClient) {
-                const recentKey = `recent:${requestKey}`;
-                const wasRecent = await this.redisClient.get(recentKey);
-
+                const wasRecent = await this.redisClient.get(`recent:${requestKey}`);
                 if (wasRecent) {
                     res.redirect(wasRecent);
                     return;
                 }
             }
 
-            // Incrementar e obter contador
             const counter = await this.getAndIncrementCounter();
-
-            // Calcular posição no ciclo (1-10)
             const cyclePosition = ((counter - 1) % 10) + 1;
-
-            // Obter o domínio da hora atual
-            const currentHourDomain = getDomainForCurrentHour();
-
-            // Determinar se deve usar link do banco (60%) ou random (40%)
             const usePrimaryLink = cyclePosition <= this.TRAFFIC_DISTRIBUTION.PRIMARY;
 
             let redirectUrl: string | null = null;
             let linkId: string | null = null;
 
-            if (usePrimaryLink) {
-                // Posições 1-6 (60%): Usar link com melhor eCPM do domínio da hora atual
-                if (this.redirectLinkRepository) {
-                    const activeLink = await this.getActiveRedirectLinkForDomain(currentHourDomain);
+            // Verificar idioma
+            const language = req.query.language as string;
 
-                    if (activeLink) {
-                        redirectUrl = activeLink.url;
-                        linkId = activeLink.id;
-                        console.log(`[60% LINK] ${redirectUrl}`);
-                    } else {
-                        redirectUrl = `https://${currentHourDomain}${generateRandomPath()}`;
-                        linkId = `fallback_no_active_${currentHourDomain}`;
-                        console.log(`[60% LINK] ${redirectUrl}`);
-                    }
+            if (usePrimaryLink) {
+                // 60%: Usar o melhor link (cache ou banco)
+                const bestLink = await this.getBestLink();
+                if (bestLink) {
+                    redirectUrl = bestLink.url;
+                    linkId = bestLink.id;
+                } else {
+                    // Fallback se não tiver link
+                    redirectUrl = `https://${domains[0]}${generateRandomPath()}`;
+                    linkId = `fallback_no_best`;
                 }
             } else {
-                // Posições 7-10 (40%): Usar domínio da hora atual + /random
-                redirectUrl = `https://${currentHourDomain}${generateRandomPath()}`;
-                linkId = `random_${currentHourDomain}`;
-                console.log(`[40% LINK] ${redirectUrl}`);
+                // 40%: Rotacionar domínios sequencialmente
+                const fallbackIndex = await this.getNextFallbackIndex();
+                const domain = domains[fallbackIndex];
+                redirectUrl = `https://${domain}${generateRandomPath()}`;
+                linkId = `random_${domain}`;
             }
 
-            // Garantir que sempre temos uma URL válida
             if (!redirectUrl) {
                 redirectUrl = 'https://useuapp.com/random';
                 linkId = 'fallback_emergency';
             }
 
-            // Preparar parâmetros UTM para adicionar à URL
+            // Adicionar prefixo de idioma se presente
+            if (language) {
+                const url = new URL(redirectUrl);
+                url.pathname = `/${language}${url.pathname}`;
+                redirectUrl = url.toString();
+            }
+
+            // Log com informação de idioma
+            const langInfo = language ? ` [${language.toUpperCase()}]` : '';
+            console.log(`[${usePrimaryLink ? '60%' : '40%'} LINK]${langInfo} ${redirectUrl}`);
+
+            // UTM params
             const utmParams = new URLSearchParams();
+            utmParams.append('utm_source', (req.query.utm_source as string) || 'jchat');
+            utmParams.append('utm_medium', (req.query.utm_medium as string) || 'broadcast');
+            utmParams.append('utm_campaign', (req.query.utm_campaign as string) || linkId || 'direct');
 
-            // utm_source: usar o da request ou 'jchat' como padrão
-            const utmSource = (req.query.utm_source as string) || 'jchat';
-            utmParams.append('utm_source', utmSource);
-
-            // utm_medium: usar o da request ou 'broadcast' como padrão
-            const utmMedium = (req.query.utm_medium as string) || 'broadcast';
-            utmParams.append('utm_medium', utmMedium);
-
-            // utm_campaign: usar o da request ou o link_id como padrão
-            const utmCampaign = (req.query.utm_campaign as string) || linkId || 'direct';
-            utmParams.append('utm_campaign', utmCampaign);
-
-            // Adicionar os parâmetros UTM à URL final
             const separator = redirectUrl.includes('?') ? '&' : '?';
             const finalRedirectUrl = `${redirectUrl}${separator}${utmParams.toString()}`;
 
-            // Registrar o click
+            // Registrar click
             if (linkId && this.redirectClickRepository) {
                 this.redirectClickRepository.incrementClick(linkId)
                     .then(result => console.log(`[CLICK RECORDED] LinkID: ${linkId}, New Count: ${result.count}`))
                     .catch(() => {});
             }
 
-            // Salvar no cache para evitar duplicação (TTL de 5 segundos)
+            // Cache anti-duplicação
             if (this.redisClient) {
                 await this.redisClient.set(`recent:${requestKey}`, finalRedirectUrl, 'EX', 5);
             }
@@ -305,78 +264,66 @@ export class RedirectController {
             res.redirect(finalRedirectUrl);
         } catch (error) {
             console.error('Error in redirect:', error);
-            // Em caso de erro, redirecionar para fallback
             res.redirect('https://useuapp.com/random');
         }
     }
 
     /**
-     * Obtém e incrementa o contador de tráfego
+     * Obtém o melhor link do cache ou banco
      */
-    private async getAndIncrementCounter(): Promise<number> {
+    private async getBestLink(): Promise<{ url: string; id: string } | null> {
         try {
-            const counter = await redis.incr(this.COUNTER_KEY);
-
-            // Reset contador se muito alto (evitar overflow)
-            if (counter > 1000000) {
-                await redis.set(this.COUNTER_KEY, '1');
-                return 1;
-            }
-
-            return counter;
-        } catch (error) {
-            console.error('Error with Redis counter:', error);
-            // Fallback: usar random se Redis falhar
-            return Math.floor(Math.random() * 10) + 1;
-        }
-    }
-
-    /**
-     * Obtém o link ativo para um domínio específico (usado na lógica de hora)
-     * Usa cache Redis para evitar queries repetidas ao MongoDB
-     */
-    private async getActiveRedirectLinkForDomain(domain: string): Promise<{ url: string; id: string } | null> {
-        const cacheKey = `active_link:${domain}`;
-
-        try {
-            // Tentar buscar do cache primeiro
+            // Tentar cache primeiro
             if (this.redisClient) {
-                const cached = await this.redisClient.get(cacheKey);
+                const cached = await this.redisClient.get(this.BEST_LINK_CACHE_KEY);
                 if (cached) {
-                    return JSON.parse(cached);
+                    const data = JSON.parse(cached);
+                    return { url: data.url, id: 'best_ecpm' };
                 }
             }
 
-            // Se não tem cache, buscar do banco
-            if (!this.redirectLinkRepository) return null;
-
-            const domainLinks = await this.redirectLinkRepository.getLinksByDomain(domain);
-            const activeLinks = domainLinks.filter(link => link.status === true);
-
-            if (activeLinks.length === 0) return null;
-
-            const selectedLink = activeLinks[0];
-            const result = {
-                url: selectedLink.url,
-                id: selectedLink._id?.toString() || ''
-            };
-
-            // Salvar no cache por 1 hora (3600 segundos)
-            if (this.redisClient) {
-                await this.redisClient.set(cacheKey, JSON.stringify(result), 'EX', 3600);
+            // Fallback: buscar do banco
+            if (this.redirectLinkRepository) {
+                const allLinks = await this.redirectLinkRepository.getAllLinks(100, 0);
+                const activeLink = allLinks.find(link => link.status === true);
+                if (activeLink) {
+                    return { url: activeLink.url, id: activeLink._id?.toString() || 'db_link' };
+                }
             }
 
-            return result;
+            return null;
         } catch (error) {
-            console.error(`Error getting active redirect link for domain ${domain}:`, error);
+            console.error('Error getting best link:', error);
             return null;
         }
     }
 
     /**
-     * Retorna estatísticas dos dados GAM
-     * Endpoint: GET /api/stats
+     * Obtém próximo índice de fallback (rotaciona 0,1,2,3,0,1,2,3...)
      */
+    private async getNextFallbackIndex(): Promise<number> {
+        try {
+            const counter = await redis.incr(this.FALLBACK_COUNTER_KEY);
+            return (counter - 1) % domains.length;
+        } catch (error) {
+            return Math.floor(Math.random() * domains.length);
+        }
+    }
+
+    private async getAndIncrementCounter(): Promise<number> {
+        try {
+            const counter = await redis.incr(this.COUNTER_KEY);
+            if (counter > 1000000) {
+                await redis.set(this.COUNTER_KEY, '1');
+                return 1;
+            }
+            return counter;
+        } catch (error) {
+            console.error('Error with Redis counter:', error);
+            return Math.floor(Math.random() * 10) + 1;
+        }
+    }
+
     public async getStats(req: Request, res: Response): Promise<void> {
         try {
             if (!this.gamAdUnitRepository || !this.redirectClickRepository) {
@@ -392,13 +339,8 @@ export class RedirectController {
                 country: req.query.country as string | undefined
             };
 
-            // Obter estatísticas do GAM
             const gamStats = await this.gamAdUnitRepository.getStats(query);
-
-            // Obter estatísticas de clicks
             const clickStats = await this.redirectClickRepository.getStats();
-
-            // Obter contador atual de tráfego
             const currentCounter = await redis.get(this.COUNTER_KEY) || '0';
 
             res.status(200).json({
@@ -421,10 +363,6 @@ export class RedirectController {
         }
     }
 
-    /**
-     * Retorna valores distintos de um campo
-     * Endpoint: GET /api/distinct/:field
-     */
     public async getDistinctValues(req: Request, res: Response): Promise<void> {
         try {
             if (!this.gamAdUnitRepository) {
@@ -436,10 +374,7 @@ export class RedirectController {
             const validFields = ['domain', 'network', 'country', 'custom_key', 'custom_value', 'ad_unit_name'];
 
             if (!validFields.includes(field)) {
-                res.status(400).json({
-                    error: 'Invalid field',
-                    validFields
-                });
+                res.status(400).json({ error: 'Invalid field', validFields });
                 return;
             }
 
@@ -459,10 +394,6 @@ export class RedirectController {
         }
     }
 
-    /**
-     * Retorna links de redirecionamento
-     * Endpoint: GET /api/links
-     */
     public async getRedirectLinks(req: Request, res: Response): Promise<void> {
         try {
             if (!this.redirectLinkRepository) {
