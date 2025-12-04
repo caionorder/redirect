@@ -229,15 +229,33 @@ export class RedirectController {
                 linkId = 'fallback_emergency';
             }
 
-            // Adicionar prefixo de idioma se presente
-            if (language) {
-                const url = new URL(redirectUrl);
-                url.pathname = `/${language}${url.pathname}`;
-                redirectUrl = url.toString();
+            // Domínios com lógica invertida de idioma
+            const invertedLangDomains = ['appmobile4u.com', 'appcombos.com'];
+            const url = new URL(redirectUrl);
+            const isInvertedDomain = invertedLangDomains.some(d => url.hostname.includes(d));
+
+            // Adicionar prefixo de idioma
+            if (isInvertedDomain) {
+                // Para appmobile4u e appcombos: sem language = /en/, com pt = direto
+                if (!language || language === 'en') {
+                    url.pathname = `/en${url.pathname}`;
+                    redirectUrl = url.toString();
+                } else if (language !== 'pt') {
+                    // Outros idiomas (es, fr, it, etc) adiciona o prefixo
+                    url.pathname = `/${language}${url.pathname}`;
+                    redirectUrl = url.toString();
+                }
+                // Se language=pt, não adiciona nada (acesso direto)
+            } else {
+                // Domínios normais: só adiciona prefixo se tiver language
+                if (language) {
+                    url.pathname = `/${language}${url.pathname}`;
+                    redirectUrl = url.toString();
+                }
             }
 
             // Log com informação de idioma
-            const langInfo = language ? ` [${language.toUpperCase()}]` : '';
+            const langInfo = language ? ` [${language.toUpperCase()}]` : (isInvertedDomain ? ' [EN]' : '');
             console.log(`[${usePrimaryLink ? '60%' : '40%'} LINK]${langInfo} ${redirectUrl}`);
 
             // UTM params

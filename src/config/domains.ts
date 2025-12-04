@@ -2,7 +2,9 @@ export const domains = [
     "useuapp.com",
     "dopeaaps.com",
     "odiahoje.com",
-    "esportesblog.com"
+    "esportesblog.com",
+    "appmobile4u.com",
+    "appcombos.com"
 ];
 
 export interface IFallbackDomain {
