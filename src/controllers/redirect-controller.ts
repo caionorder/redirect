@@ -263,6 +263,8 @@ export class RedirectController {
             utmParams.append('utm_source', (req.query.utm_source as string) || 'jchat');
             utmParams.append('utm_medium', (req.query.utm_medium as string) || 'broadcast');
             utmParams.append('utm_campaign', (req.query.utm_campaign as string) || linkId || 'direct');
+            if (req.query.utm_term) utmParams.append('utm_term', req.query.utm_term as string);
+            if (req.query.utm_content) utmParams.append('utm_content', req.query.utm_content as string);
 
             const separator = redirectUrl.includes('?') ? '&' : '?';
             const finalRedirectUrl = `${redirectUrl}${separator}${utmParams.toString()}`;
