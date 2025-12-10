@@ -265,6 +265,8 @@ export class RedirectController {
             utmParams.append('utm_campaign', (req.query.utm_campaign as string) || linkId || 'direct');
             if (req.query.utm_term) utmParams.append('utm_term', req.query.utm_term as string);
             if (req.query.utm_content) utmParams.append('utm_content', req.query.utm_content as string);
+            if (req.query.fbclid) utmParams.append('fbclid', req.query.fbclid as string);
+            if (req.query.gclid) utmParams.append('gclid', req.query.gclid as string);
 
             const separator = redirectUrl.includes('?') ? '&' : '?';
             const finalRedirectUrl = `${redirectUrl}${separator}${utmParams.toString()}`;
