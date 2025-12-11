@@ -4,7 +4,11 @@ export const domains = [
     "odiahoje.com",
     "esportesblog.com",
     "appmobile4u.com",
-    "appcombos.com"
+    "appcombos.com",
+    "informanoticia.com",
+    "buscaapp.com.br",
+    "lavoriinitalia.com",
+    "cincosete.com"
 ];
 
 export interface IFallbackDomain {

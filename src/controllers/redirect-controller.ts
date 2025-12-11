@@ -230,7 +230,7 @@ export class RedirectController {
             }
 
             // Domínios com lógica invertida de idioma
-            const invertedLangDomains = ['appmobile4u.com', 'appcombos.com'];
+            const invertedLangDomains = ['appmobile4u.com', 'appcombos.com', 'informanoticia.com', 'buscaapp.com.br', 'lavoriinitalia.com', 'cincosete.com'];
             const url = new URL(redirectUrl);
             const isInvertedDomain = invertedLangDomains.some(d => url.hostname.includes(d));
 
@@ -260,7 +260,7 @@ export class RedirectController {
 
             // UTM params
             const utmParams = new URLSearchParams();
-            utmParams.append('utm_source', (req.query.utm_source as string) || 'jchat');
+            utmParams.append('utm_source', (req.query.utm_source as string) || 'redron');
             utmParams.append('utm_medium', (req.query.utm_medium as string) || 'broadcast');
             utmParams.append('utm_campaign', (req.query.utm_campaign as string) || linkId || 'direct');
             if (req.query.utm_term) utmParams.append('utm_term', req.query.utm_term as string);
