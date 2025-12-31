@@ -33,6 +33,11 @@ export class RedirectController {
     private readonly BEST_LINKS_MAP_KEY = 'redirect:best_links_map';
     private readonly VISITOR_PREFIX = 'visitor';
 
+    // Cache em memória para evitar chamadas repetidas ao Redis
+    private bestLinksMapCache: BestLinkMap | null = null;
+    private bestLinksMapCacheTime: number = 0;
+    private readonly CACHE_TTL_MS = 60000; // 1 minuto de cache em memória
+
     constructor(db?: Db) {
         this.superFilterService = new SuperFilterService();
         this.redisClient = redis;
@@ -170,17 +175,6 @@ export class RedirectController {
     }
 
     /**
-     * Marca que o visitante viu o dominio nesta hora
-     * TTL de 1 hora
-     */
-    private async markVisitorSawDomain(ip: string, domain: string): Promise<void> {
-        if (!this.redisClient) return;
-
-        const key = this.getVisitorKey(ip, domain);
-        await this.redisClient.set(key, '1', 'EX', 3600);
-    }
-
-    /**
      * Obtem o proximo dominio na rotacao sequencial
      */
     private async getNextDomain(): Promise<string> {
@@ -195,20 +189,28 @@ export class RedirectController {
     }
 
     /**
-     * Obtem o mapa de melhores links do cache
+     * Obtem o mapa de melhores links do cache (com cache em memória)
      */
     private async getBestLinksMap(): Promise<BestLinkMap | null> {
         try {
-            if (!this.redisClient) return null;
+            // Verificar cache em memória primeiro
+            const now = Date.now();
+            if (this.bestLinksMapCache && (now - this.bestLinksMapCacheTime) < this.CACHE_TTL_MS) {
+                return this.bestLinksMapCache;
+            }
+
+            if (!this.redisClient) return this.bestLinksMapCache;
 
             const cached = await this.redisClient.get(this.BEST_LINKS_MAP_KEY);
             if (cached) {
-                return JSON.parse(cached) as BestLinkMap;
+                this.bestLinksMapCache = JSON.parse(cached) as BestLinkMap;
+                this.bestLinksMapCacheTime = now;
+                return this.bestLinksMapCache;
             }
-            return null;
+            return this.bestLinksMapCache;
         } catch (error) {
             console.error('Error getting best links map:', error);
-            return null;
+            return this.bestLinksMapCache;
         }
     }
 
@@ -225,32 +227,13 @@ export class RedirectController {
                 return;
             }
 
-            const ignoredParams = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
-                                  'fbclid', 'gclid', 'msclkid', 'ref', 'referrer', '_ga', '_gid'];
-
-            const cleanQuery: Record<string, any> = {};
-            for (const [key, value] of Object.entries(req.query)) {
-                if (!ignoredParams.includes(key) && !key.startsWith('utm_')) {
-                    cleanQuery[key] = value;
-                }
-            }
-
             // Identificar visitante por IP
             const clientIp = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ||
                            req.socket.remoteAddress || 'unknown';
-            const requestKey = `${clientIp}_${req.path}_${JSON.stringify(cleanQuery)}`;
-
-            // Anti-duplicacao (cache de 5 segundos)
-            if (this.redisClient) {
-                const wasRecent = await this.redisClient.get(`recent:${requestKey}`);
-                if (wasRecent) {
-                    res.redirect(wasRecent);
-                    return;
-                }
-            }
 
             // Obter o proximo dominio na rotacao
             const domain = await this.getNextDomain();
+            const visitorKey = this.getVisitorKey(clientIp, domain);
 
             // Verificar idioma
             const language = req.query.language as string;
@@ -283,8 +266,10 @@ export class RedirectController {
                     logType = 'RANDOM LINK';
                 }
 
-                // Marcar que o visitante viu este dominio
-                await this.markVisitorSawDomain(clientIp, domain);
+                // Marcar que o visitante viu este dominio (fire and forget)
+                if (this.redisClient) {
+                    this.redisClient.set(visitorKey, '1', 'EX', 3600).catch(() => {});
+                }
             }
 
             // Dominios com logica invertida de idioma
@@ -337,9 +322,9 @@ export class RedirectController {
                     .catch(() => {});
             }
 
-            // Cache anti-duplicacao
+            // Cache anti-duplicacao (fire and forget)
             if (this.redisClient) {
-                await this.redisClient.set(`recent:${requestKey}`, finalRedirectUrl, 'EX', 5);
+                this.redisClient.set(`recent:${clientIp}`, finalRedirectUrl, 'EX', 5).catch(() => {});
             }
 
             res.redirect(finalRedirectUrl);
