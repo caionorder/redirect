@@ -58,7 +58,16 @@ export class RedirectController {
      * Cron: minuto 30 de cada hora - busca melhor eCPM de CADA dominio
      */
     private initializeScheduledProcess(): void {
+        console.log('[CRON] Inicializando agendamento - executará no minuto 30 de cada hora');
+
+        // Executar imediatamente na inicialização para popular o cache
+        this.executeProcessInternal()
+            .then(() => console.log('[CRON] Cache inicial populado com sucesso'))
+            .catch(err => console.error('[CRON] Erro ao popular cache inicial:', err));
+
+        // Agendar para rodar no minuto 30
         const task = cron.schedule('30 * * * *', async () => {
+            console.log('[CRON] Executando atualização agendada...');
             try {
                 await this.executeProcessInternal();
             } catch (error) {
@@ -264,6 +273,12 @@ export class RedirectController {
                     redirectUrl = `https://${domain}${generateRandomPath()}`;
                     linkId = `fallback_${domain}`;
                     logType = 'RANDOM LINK';
+                    // Debug: mostrar porque caiu no fallback
+                    if (!bestLinksMap) {
+                        console.log(`[DEBUG] bestLinksMap está VAZIO - rode /api/process para popular`);
+                    } else {
+                        console.log(`[DEBUG] Domínio "${domain}" não encontrado no mapa. Domínios disponíveis: ${Object.keys(bestLinksMap).join(', ')}`);
+                    }
                 }
 
                 // Marcar que o visitante viu este dominio (fire and forget)
