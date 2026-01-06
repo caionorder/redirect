@@ -21,6 +21,16 @@ interface BestLinkMap {
     };
 }
 
+/**
+ * Interface para domínios ordenados por eCPM
+ */
+interface SortedDomain {
+    domain: string;
+    url: string;
+    postId: string;
+    ecpm: number;
+}
+
 export class RedirectController {
     private superFilterService: SuperFilterService;
     private gamAdUnitRepository?: GamAdUnitRepository;
@@ -31,11 +41,14 @@ export class RedirectController {
     // Chaves Redis
     private readonly DOMAIN_COUNTER_KEY = 'redirect:domain:counter';
     private readonly BEST_LINKS_MAP_KEY = 'redirect:best_links_map';
+    private readonly SORTED_DOMAINS_KEY = 'redirect:sorted_domains';
     private readonly VISITOR_PREFIX = 'visitor';
 
     // Cache em memória para evitar chamadas repetidas ao Redis
     private bestLinksMapCache: BestLinkMap | null = null;
     private bestLinksMapCacheTime: number = 0;
+    private sortedDomainsCache: SortedDomain[] | null = null;
+    private sortedDomainsCacheTime: number = 0;
     private readonly CACHE_TTL_MS = 60000; // 1 minuto de cache em memória
 
     constructor(db?: Db) {
@@ -79,7 +92,7 @@ export class RedirectController {
 
     /**
      * Busca em TODOS os dominios o melhor post (maior eCPM) de CADA dominio
-     * Salva no Redis um mapa: { dominio: melhor_url }
+     * Salva no Redis e atualiza o MongoDB (desativa antigos, ativa novos)
      */
     private async executeProcessInternal(): Promise<BestLinkMap | null> {
         const date = new Date();
@@ -132,7 +145,62 @@ export class RedirectController {
                 'EX',
                 3600
             );
+            // Atualizar cache em memória também
+            this.bestLinksMapCache = bestByDomain;
+            this.bestLinksMapCacheTime = Date.now();
+
+            // Criar lista ordenada por eCPM (maior primeiro)
+            const sortedDomains: SortedDomain[] = Object.entries(bestByDomain)
+                .map(([domain, info]) => ({
+                    domain,
+                    url: info.url,
+                    postId: info.postId,
+                    ecpm: info.ecpm
+                }))
+                .sort((a, b) => b.ecpm - a.ecpm);
+
+            // Salvar lista ordenada no Redis
+            await this.redisClient.set(
+                this.SORTED_DOMAINS_KEY,
+                JSON.stringify(sortedDomains),
+                'EX',
+                3600
+            );
+            this.sortedDomainsCache = sortedDomains;
+            this.sortedDomainsCacheTime = Date.now();
+
             console.log(`[CRON] Mapa de melhores links atualizado: ${Object.keys(bestByDomain).length} dominios`);
+            console.log(`[CRON] Ordem por eCPM: ${sortedDomains.map(d => `${d.domain}(${d.ecpm.toFixed(2)})`).join(' > ')}`);
+        }
+
+        // Atualizar MongoDB: desativar todos e ativar apenas os melhores
+        if (this.redirectLinkRepository) {
+            try {
+                // 1. Desativar TODOS os links ativos
+                const allLinks = await this.redirectLinkRepository.getAllLinks(1000, 0);
+                for (const link of allLinks) {
+                    if (link._id && link.status === true) {
+                        await this.redirectLinkRepository.updateLink(link._id.toString(), { status: false });
+                    }
+                }
+
+                // 2. Ativar ou criar apenas os melhores de cada domínio
+                for (const [domain, info] of Object.entries(bestByDomain)) {
+                    const existing = await this.redirectLinkRepository.getLinkByDomainAndUrl(domain, info.url);
+                    if (existing && existing._id) {
+                        await this.redirectLinkRepository.updateLink(existing._id.toString(), { status: true });
+                    } else {
+                        await this.redirectLinkRepository.createLink({
+                            domain: domain,
+                            url: info.url,
+                            status: true
+                        });
+                    }
+                }
+                console.log(`[CRON] MongoDB atualizado: ${Object.keys(bestByDomain).length} links ativos`);
+            } catch (error) {
+                console.error('[CRON] Erro ao atualizar MongoDB:', error);
+            }
         }
 
         // Log dos melhores links
@@ -164,35 +232,45 @@ export class RedirectController {
     }
 
     /**
-     * Gera a chave de visitante para rastreamento
-     * Formato: visitor:{ip}:{hora}:{dominio}
+     * Gera a chave para contar quantos domínios o visitante já viu nesta hora
+     * Formato: visitor_count:{ip}:{hora}
      */
-    private getVisitorKey(ip: string, domain: string): string {
+    private getVisitorCountKey(ip: string): string {
         const hour = new Date().getHours();
-        return `${this.VISITOR_PREFIX}:${ip}:${hour}:${domain}`;
+        return `${this.VISITOR_PREFIX}_count:${ip}:${hour}`;
     }
 
     /**
-     * Verifica se o visitante ja viu o dominio nesta hora
+     * Obtém e incrementa o contador de domínios visitados pelo usuário nesta hora
+     * Retorna o número do próximo domínio a visitar (1, 2, 3... até domains.length, depois continua incrementando)
      */
-    private async hasVisitorSeenDomain(ip: string, domain: string): Promise<boolean> {
-        if (!this.redisClient) return false;
+    private async getAndIncrementVisitorDomainCount(ip: string): Promise<number> {
+        if (!this.redisClient) return 1;
 
-        const key = this.getVisitorKey(ip, domain);
-        const seen = await this.redisClient.get(key);
-        return seen !== null;
+        try {
+            const key = this.getVisitorCountKey(ip);
+            const count = await this.redisClient.incr(key);
+
+            // Definir TTL de 1 hora apenas na primeira vez
+            if (count === 1) {
+                await this.redisClient.expire(key, 3600);
+            }
+
+            return count;
+        } catch (error) {
+            return 1;
+        }
     }
 
     /**
-     * Obtem o proximo dominio na rotacao sequencial
+     * Obtem o proximo dominio na rotacao sequencial (global, para o /random)
      */
-    private async getNextDomain(): Promise<string> {
+    private async getNextRandomDomain(): Promise<string> {
         try {
             const counter = await redis.incr(this.DOMAIN_COUNTER_KEY);
             const index = (counter - 1) % domains.length;
             return domains[index];
         } catch (error) {
-            // Fallback aleatorio em caso de erro
             return domains[Math.floor(Math.random() * domains.length)];
         }
     }
@@ -224,10 +302,36 @@ export class RedirectController {
     }
 
     /**
+     * Obtem a lista de dominios ordenados por eCPM (maior primeiro)
+     */
+    private async getSortedDomains(): Promise<SortedDomain[]> {
+        try {
+            // Verificar cache em memória primeiro
+            const now = Date.now();
+            if (this.sortedDomainsCache && this.sortedDomainsCache.length > 0 && (now - this.sortedDomainsCacheTime) < this.CACHE_TTL_MS) {
+                return this.sortedDomainsCache;
+            }
+
+            if (!this.redisClient) return this.sortedDomainsCache || [];
+
+            const cached = await this.redisClient.get(this.SORTED_DOMAINS_KEY);
+            if (cached) {
+                this.sortedDomainsCache = JSON.parse(cached) as SortedDomain[];
+                this.sortedDomainsCacheTime = now;
+                return this.sortedDomainsCache;
+            }
+            return this.sortedDomainsCache || [];
+        } catch (error) {
+            console.error('Error getting sorted domains:', error);
+            return this.sortedDomainsCache || [];
+        }
+    }
+
+    /**
      * Redirect principal com nova logica:
-     * - Rotaciona dominios sequencialmente
-     * - Se visitante ja viu o dominio naquela hora -> /random
-     * - Se primeira visita -> melhor link do dominio
+     * - Sempre envia para o melhor eCPM
+     * - Cada visita do mesmo usuário vai para o próximo domínio
+     * - Quando acabar todos os domínios, usa /random
      */
     public async redirect(req: Request, res: Response): Promise<void> {
         try {
@@ -240,27 +344,32 @@ export class RedirectController {
             const clientIp = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ||
                            req.socket.remoteAddress || 'unknown';
 
-            // Obter o proximo dominio na rotacao
-            const domain = await this.getNextDomain();
-            const visitorKey = this.getVisitorKey(clientIp, domain);
-
             // Verificar idioma
             const language = req.query.language as string;
 
-            // Verificar se o visitante ja viu este dominio nesta hora
-            const hasSeenDomain = await this.hasVisitorSeenDomain(clientIp, domain);
+            // Obter qual visita é essa do usuário nesta hora (1, 2, 3...)
+            const visitNumber = await this.getAndIncrementVisitorDomainCount(clientIp);
 
             let redirectUrl: string;
             let linkId: string;
             let logType: string;
+            let domain: string;
 
-            if (hasSeenDomain) {
-                // Visitante ja viu este dominio nesta hora -> /random
-                redirectUrl = `https://${domain}${generateRandomPath()}`;
-                linkId = `random_${domain}`;
-                logType = 'RANDOM LINK';
-            } else {
-                // Primeira visita do visitante neste dominio nesta hora -> melhor link
+            // Obter lista de domínios ordenados por eCPM (maior primeiro)
+            const sortedDomains = await this.getSortedDomains();
+
+            // Se ainda não visitou todos os domínios, usa o próximo na ordem de eCPM
+            if (sortedDomains.length > 0 && visitNumber <= sortedDomains.length) {
+                // Pegar o domínio baseado no número da visita ordenado por eCPM
+                // visita 1 = maior eCPM, visita 2 = segundo maior, etc
+                const sortedDomain = sortedDomains[visitNumber - 1];
+                domain = sortedDomain.domain;
+                redirectUrl = sortedDomain.url;
+                linkId = `best_${domain}_${sortedDomain.postId}`;
+                logType = 'BEST LINK';
+            } else if (sortedDomains.length === 0 && visitNumber <= domains.length) {
+                // Fallback se não tiver dados ordenados: usa ordem fixa
+                domain = domains[visitNumber - 1];
                 const bestLinksMap = await this.getBestLinksMap();
                 const bestLinkInfo = bestLinksMap?.[domain];
 
@@ -269,22 +378,17 @@ export class RedirectController {
                     linkId = `best_${domain}_${bestLinkInfo.postId}`;
                     logType = 'BEST LINK';
                 } else {
-                    // Fallback se nao tiver melhor link para este dominio
                     redirectUrl = `https://${domain}${generateRandomPath()}`;
                     linkId = `fallback_${domain}`;
                     logType = 'RANDOM LINK';
-                    // Debug: mostrar porque caiu no fallback
-                    if (!bestLinksMap) {
-                        console.log(`[DEBUG] bestLinksMap está VAZIO - rode /api/process para popular`);
-                    } else {
-                        console.log(`[DEBUG] Domínio "${domain}" não encontrado no mapa. Domínios disponíveis: ${Object.keys(bestLinksMap).join(', ')}`);
-                    }
+                    console.log(`[DEBUG] sortedDomains e bestLinksMap vazios - rode /api/process para popular`);
                 }
-
-                // Marcar que o visitante viu este dominio (fire and forget)
-                if (this.redisClient) {
-                    this.redisClient.set(visitorKey, '1', 'EX', 3600).catch(() => {});
-                }
+            } else {
+                // Já visitou todos os domínios, agora usa /random rotacionando
+                domain = await this.getNextRandomDomain();
+                redirectUrl = `https://${domain}${generateRandomPath()}`;
+                linkId = `random_${domain}`;
+                logType = 'RANDOM LINK';
             }
 
             // Dominios com logica invertida de idioma
@@ -312,10 +416,14 @@ export class RedirectController {
                 }
             }
 
-            // Log com informacao de idioma e dominio
+            // Log com informacao de idioma, dominio e eCPM
             const langInfo = language ? ` [${language.toUpperCase()}]` : (isInvertedDomain ? ' [EN]' : '');
-            const visitInfo = hasSeenDomain ? ' (revisita)' : ' (1a visita)';
-            console.log(`[${logType}]${langInfo} ${domain}${visitInfo} -> ${redirectUrl}`);
+            const totalDomains = sortedDomains.length > 0 ? sortedDomains.length : domains.length;
+            const visitInfo = visitNumber <= totalDomains ? ` (visita ${visitNumber}/${totalDomains})` : ' (extra)';
+            const ecpmInfo = sortedDomains.length > 0 && visitNumber <= sortedDomains.length
+                ? ` eCPM:${sortedDomains[visitNumber - 1].ecpm.toFixed(2)}`
+                : '';
+            console.log(`[${logType}]${langInfo}${ecpmInfo} ${domain}${visitInfo} -> ${redirectUrl}`);
 
             // UTM params
             const utmParams = new URLSearchParams();
