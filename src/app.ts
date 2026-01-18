@@ -82,6 +82,9 @@ export async function createApp(): Promise<Express> {
         // IMPORTANTE: Rota raiz "/" executa o redirect diretamente
         app.get('/', (req, res) => redirectController.redirect(req, res));
 
+        // Rota "/db" executa o redirect usando domains_db
+        app.get('/db', (req, res) => redirectController.redirectDb(req, res));
+
         // Montar as rotas em /api
         app.use('/api', createRedirectRouter(db));
     } else {

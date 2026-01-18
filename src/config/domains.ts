@@ -4,12 +4,19 @@ export const domains = [
     "odiahoje.com",
     "esportesblog.com",
     "appmobile4u.com",
-    "appcombos.com",
+    // "appcombos.com",
     "informanoticia.com",
     "buscaapp.com.br",
-    "lavoriinitalia.com",
-    "cincosete.com"
+    "lavoriinitalia.com"
+    // "cincosete.com"
 ];
+
+export const domains_db = [
+    "appmynews.com",
+    "hoteltyp.com"
+    // "ghcconnect.com"
+];
+
 
 export interface IFallbackDomain {
     url: string;

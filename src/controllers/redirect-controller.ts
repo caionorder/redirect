@@ -8,7 +8,7 @@ import { RedirectLinkRepository } from '../repositories/redirect-link-repository
 import { RedirectClickRepository } from '../repositories/redirect-click-repository';
 import { IFilterRequest } from '../interfaces/filter-interfaces';
 import { redis } from '../config/redis';
-import { generateRandomPath, domains } from '../config/domains';
+import { generateRandomPath, domains, domains_db } from '../config/domains';
 
 /**
  * Interface para o mapa de melhores links por dominio
@@ -33,10 +33,18 @@ export class RedirectController {
     private readonly BEST_LINKS_MAP_KEY = 'redirect:best_links_map';
     private readonly VISITOR_PREFIX = 'visitor';
 
+    // Chaves Redis para domains_db
+    private readonly DOMAIN_DB_COUNTER_KEY = 'redirect:domain_db:counter';
+    private readonly BEST_LINKS_MAP_DB_KEY = 'redirect:best_links_map_db';
+
     // Cache em memória para evitar chamadas repetidas ao Redis
     private bestLinksMapCache: BestLinkMap | null = null;
     private bestLinksMapCacheTime: number = 0;
     private readonly CACHE_TTL_MS = 60000; // 1 minuto de cache em memória
+
+    // Cache em memória para domains_db
+    private bestLinksMapDbCache: BestLinkMap | null = null;
+    private bestLinksMapDbCacheTime: number = 0;
 
     constructor(db?: Db) {
         this.superFilterService = new SuperFilterService();
@@ -65,11 +73,17 @@ export class RedirectController {
             .then(() => console.log('[CRON] Cache inicial populado com sucesso'))
             .catch(err => console.error('[CRON] Erro ao popular cache inicial:', err));
 
+        // Executar imediatamente para domains_db
+        this.executeProcessInternalDb()
+            .then(() => console.log('[CRON] Cache inicial DB populado com sucesso'))
+            .catch(err => console.error('[CRON] Erro ao popular cache inicial DB:', err));
+
         // Agendar para rodar no minuto 30
         const task = cron.schedule('30 * * * *', async () => {
             console.log('[CRON] Executando atualização agendada...');
             try {
                 await this.executeProcessInternal();
+                await this.executeProcessInternalDb();
             } catch (error) {
                 console.error('[CRON] Erro:', error);
             }
@@ -144,6 +158,77 @@ export class RedirectController {
     }
 
     /**
+     * Busca em domains_db o melhor post (maior eCPM) de CADA dominio
+     * Salva no Redis um mapa separado: { dominio: melhor_url }
+     */
+    private async executeProcessInternalDb(): Promise<BestLinkMap | null> {
+        if (domains_db.length === 0) {
+            console.log('[CRON-DB] Nenhum domínio configurado em domains_db');
+            return null;
+        }
+
+        const date = new Date();
+        const today = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+
+        const filterRequest: IFilterRequest = {
+            start: today.toISOString().split('T')[0],
+            end: today.toISOString().split('T')[0],
+            domain: domains_db,
+            custom_key: "id_post_wp",
+            group: ["domain", "custom_key", "custom_value"]
+        };
+
+        if (!this.gamAdUnitRepository) {
+            throw new Error('Database not connected');
+        }
+
+        const data = await this.superFilterService.execute(filterRequest, this.gamAdUnitRepository);
+
+        if (!Array.isArray(data) || data.length === 0) {
+            console.log('[CRON-DB] Nenhum dado encontrado para processar');
+            return null;
+        }
+
+        // Agrupar por dominio e pegar o melhor de cada
+        const bestByDomain: BestLinkMap = {};
+
+        for (const item of data) {
+            if (!item.domain || !item.custom_value) continue;
+
+            const domain = item.domain as string;
+            const ecpm = parseFloat(String(item.ecpm || 0));
+            const postId = String(item.custom_value);
+
+            // Se ainda nao temos esse dominio ou este tem eCPM maior
+            if (!bestByDomain[domain] || ecpm > bestByDomain[domain].ecpm) {
+                bestByDomain[domain] = {
+                    url: `https://${domain}/?p=${encodeURIComponent(postId)}`,
+                    postId: postId,
+                    ecpm: ecpm
+                };
+            }
+        }
+
+        // Salvar no cache Redis (1 hora)
+        if (this.redisClient && Object.keys(bestByDomain).length > 0) {
+            await this.redisClient.set(
+                this.BEST_LINKS_MAP_DB_KEY,
+                JSON.stringify(bestByDomain),
+                'EX',
+                3600
+            );
+            console.log(`[CRON-DB] Mapa de melhores links DB atualizado: ${Object.keys(bestByDomain).length} dominios`);
+        }
+
+        // Log dos melhores links
+        for (const [domain, info] of Object.entries(bestByDomain)) {
+            console.log(`[CRON-DB] ${domain} -> p=${info.postId} (eCPM: ${info.ecpm.toFixed(4)})`);
+        }
+
+        return bestByDomain;
+    }
+
+    /**
      * Endpoint manual: GET /api/process
      */
     public async process(_req: Request, res: Response): Promise<void> {
@@ -198,6 +283,20 @@ export class RedirectController {
     }
 
     /**
+     * Obtem o proximo dominio na rotacao sequencial para domains_db
+     */
+    private async getNextDomainDb(): Promise<string> {
+        try {
+            const counter = await redis.incr(this.DOMAIN_DB_COUNTER_KEY);
+            const index = (counter - 1) % domains_db.length;
+            return domains_db[index];
+        } catch (error) {
+            // Fallback aleatorio em caso de erro
+            return domains_db[Math.floor(Math.random() * domains_db.length)];
+        }
+    }
+
+    /**
      * Obtem o mapa de melhores links do cache (com cache em memória)
      */
     private async getBestLinksMap(): Promise<BestLinkMap | null> {
@@ -220,6 +319,32 @@ export class RedirectController {
         } catch (error) {
             console.error('Error getting best links map:', error);
             return this.bestLinksMapCache;
+        }
+    }
+
+    /**
+     * Obtem o mapa de melhores links do cache para domains_db (com cache em memória)
+     */
+    private async getBestLinksMapDb(): Promise<BestLinkMap | null> {
+        try {
+            // Verificar cache em memória primeiro
+            const now = Date.now();
+            if (this.bestLinksMapDbCache && (now - this.bestLinksMapDbCacheTime) < this.CACHE_TTL_MS) {
+                return this.bestLinksMapDbCache;
+            }
+
+            if (!this.redisClient) return this.bestLinksMapDbCache;
+
+            const cached = await this.redisClient.get(this.BEST_LINKS_MAP_DB_KEY);
+            if (cached) {
+                this.bestLinksMapDbCache = JSON.parse(cached) as BestLinkMap;
+                this.bestLinksMapDbCacheTime = now;
+                return this.bestLinksMapDbCache;
+            }
+            return this.bestLinksMapDbCache;
+        } catch (error) {
+            console.error('Error getting best links map DB:', error);
+            return this.bestLinksMapDbCache;
         }
     }
 
@@ -288,7 +413,9 @@ export class RedirectController {
             }
 
             // Dominios com logica invertida de idioma
-            const invertedLangDomains = ['appmobile4u.com', 'appcombos.com', 'informanoticia.com', 'buscaapp.com.br', 'lavoriinitalia.com', 'cincosete.com'];
+            const invertedLangDomains = ['appmobile4u.com', 'appcombos.com', 'informanoticia.com', 'buscaapp.com.br', 'lavoriinitalia.com'
+                // 'cincosete.com'
+            ];
             const url = new URL(redirectUrl);
             const isInvertedDomain = invertedLangDomains.some(d => url.hostname.includes(d));
 
@@ -346,6 +473,112 @@ export class RedirectController {
         } catch (error) {
             console.error('Error in redirect:', error);
             res.redirect('https://useuapp.com/random');
+        }
+    }
+
+    /**
+     * Redirect para domains_db com mesma logica:
+     * - Rotaciona dominios_db sequencialmente
+     * - Se visitante ja viu o dominio naquela hora -> /random
+     * - Se primeira visita -> melhor link do dominio
+     */
+    public async redirectDb(req: Request, res: Response): Promise<void> {
+        try {
+            if (req.path.includes('favicon') || req.url.includes('favicon')) {
+                res.status(204).end();
+                return;
+            }
+
+            if (domains_db.length === 0) {
+                res.status(503).json({ error: 'No domains_db configured' });
+                return;
+            }
+
+            // Identificar visitante por IP
+            const clientIp = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ||
+                           req.socket.remoteAddress || 'unknown';
+
+            // Obter o proximo dominio na rotacao (domains_db)
+            const domain = await this.getNextDomainDb();
+            const visitorKey = this.getVisitorKey(clientIp, domain);
+
+            // Verificar se o visitante ja viu este dominio nesta hora
+            const hasSeenDomain = await this.hasVisitorSeenDomain(clientIp, domain);
+
+            let redirectUrl: string;
+            let linkId: string;
+            let logType: string;
+
+            if (hasSeenDomain) {
+                // Visitante ja viu este dominio nesta hora -> /random
+                redirectUrl = `https://${domain}${generateRandomPath()}`;
+                linkId = `random_db_${domain}`;
+                logType = 'RANDOM LINK DB';
+            } else {
+                // Primeira visita do visitante neste dominio nesta hora -> melhor link
+                const bestLinksMap = await this.getBestLinksMapDb();
+                const bestLinkInfo = bestLinksMap?.[domain];
+
+                if (bestLinkInfo) {
+                    redirectUrl = bestLinkInfo.url;
+                    linkId = `best_db_${domain}_${bestLinkInfo.postId}`;
+                    logType = 'BEST LINK DB';
+                } else {
+                    // Fallback se nao tiver melhor link para este dominio
+                    redirectUrl = `https://${domain}${generateRandomPath()}`;
+                    linkId = `fallback_db_${domain}`;
+                    logType = 'RANDOM LINK DB';
+                    // Debug: mostrar porque caiu no fallback
+                    if (!bestLinksMap) {
+                        console.log(`[DEBUG-DB] bestLinksMapDb está VAZIO - rode /api/process para popular`);
+                    } else {
+                        console.log(`[DEBUG-DB] Domínio "${domain}" não encontrado no mapa DB. Domínios disponíveis: ${Object.keys(bestLinksMap).join(', ')}`);
+                    }
+                }
+
+                // Marcar que o visitante viu este dominio (fire and forget)
+                if (this.redisClient) {
+                    this.redisClient.set(visitorKey, '1', 'EX', 3600).catch(() => {});
+                }
+            }
+
+            // domains_db não usa prefixo de idioma (/en/, /es/, etc)
+
+            // Log
+            const visitInfo = hasSeenDomain ? ' (revisita)' : ' (1a visita)';
+            console.log(`[${logType}] ${domain}${visitInfo} -> ${redirectUrl}`);
+
+            // UTM params
+            const utmParams = new URLSearchParams();
+            utmParams.append('utm_source', (req.query.utm_source as string) || 'redron');
+            utmParams.append('utm_medium', (req.query.utm_medium as string) || 'broadcast');
+            utmParams.append('utm_campaign', (req.query.utm_campaign as string) || linkId || 'direct');
+            if (req.query.utm_term) utmParams.append('utm_term', req.query.utm_term as string);
+            if (req.query.utm_content) utmParams.append('utm_content', req.query.utm_content as string);
+            if (req.query.fbclid) utmParams.append('fbclid', req.query.fbclid as string);
+            if (req.query.gclid) utmParams.append('gclid', req.query.gclid as string);
+
+            const separator = redirectUrl.includes('?') ? '&' : '?';
+            const finalRedirectUrl = `${redirectUrl}${separator}${utmParams.toString()}`;
+
+            // Registrar click
+            if (linkId && this.redirectClickRepository) {
+                this.redirectClickRepository.incrementClick(linkId)
+                    .then(result => console.log(`[CLICK RECORDED DB] LinkID: ${linkId}, New Count: ${result.count}`))
+                    .catch(() => {});
+            }
+
+            // Cache anti-duplicacao (fire and forget)
+            if (this.redisClient) {
+                this.redisClient.set(`recent:${clientIp}`, finalRedirectUrl, 'EX', 5).catch(() => {});
+            }
+
+            res.redirect(finalRedirectUrl);
+        } catch (error) {
+            console.error('Error in redirectDb:', error);
+            // Fallback para primeiro dominio do domains_db
+            const fallbackDomain = domains_db[0] || 'appmynews.com';
+            res.redirect(`https://${fallbackDomain}/random`);
         }
     }
 
