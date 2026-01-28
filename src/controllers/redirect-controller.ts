@@ -412,35 +412,41 @@ export class RedirectController {
                 }
             }
 
+            // Dominios que NAO usam prefixo de idioma (vao "brutos")
+            const noLangPrefixDomains = ['promo.dopeaaps.com'];
+
             // Dominios com logica invertida de idioma
             const invertedLangDomains = ['appmobile4u.com', 'appcombos.com', 'informanoticia.com', 'buscaapp.com.br', 'lavoriinitalia.com'
                 // 'cincosete.com'
             ];
             const url = new URL(redirectUrl);
+            const isNoLangDomain = noLangPrefixDomains.some(d => url.hostname.includes(d));
             const isInvertedDomain = invertedLangDomains.some(d => url.hostname.includes(d));
 
-            // Adicionar prefixo de idioma
-            if (isInvertedDomain) {
-                // Para dominios invertidos: sem language = /en/, com pt = direto
-                if (!language || language === 'en') {
-                    url.pathname = `/en${url.pathname}`;
-                    redirectUrl = url.toString();
-                } else if (language !== 'pt') {
-                    // Outros idiomas (es, fr, it, etc) adiciona o prefixo
-                    url.pathname = `/${language}${url.pathname}`;
-                    redirectUrl = url.toString();
-                }
-                // Se language=pt, nao adiciona nada (acesso direto)
-            } else {
-                // Dominios normais: so adiciona prefixo se tiver language
-                if (language) {
-                    url.pathname = `/${language}${url.pathname}`;
-                    redirectUrl = url.toString();
+            // Adicionar prefixo de idioma (exceto para dominios "brutos")
+            if (!isNoLangDomain) {
+                if (isInvertedDomain) {
+                    // Para dominios invertidos: sem language = /en/, com pt = direto
+                    if (!language || language === 'en') {
+                        url.pathname = `/en${url.pathname}`;
+                        redirectUrl = url.toString();
+                    } else if (language !== 'pt') {
+                        // Outros idiomas (es, fr, it, etc) adiciona o prefixo
+                        url.pathname = `/${language}${url.pathname}`;
+                        redirectUrl = url.toString();
+                    }
+                    // Se language=pt, nao adiciona nada (acesso direto)
+                } else {
+                    // Dominios normais: so adiciona prefixo se tiver language
+                    if (language) {
+                        url.pathname = `/${language}${url.pathname}`;
+                        redirectUrl = url.toString();
+                    }
                 }
             }
 
             // Log com informacao de idioma e dominio
-            const langInfo = language ? ` [${language.toUpperCase()}]` : (isInvertedDomain ? ' [EN]' : '');
+            const langInfo = isNoLangDomain ? ' [BRUTO]' : (language ? ` [${language.toUpperCase()}]` : (isInvertedDomain ? ' [EN]' : ''));
             const visitInfo = hasSeenDomain ? ' (revisita)' : ' (1a visita)';
             console.log(`[${logType}]${langInfo} ${domain}${visitInfo} -> ${redirectUrl}`);
 

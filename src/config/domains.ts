@@ -7,8 +7,9 @@ export const domains = [
     // "appcombos.com",
     "informanoticia.com",
     "buscaapp.com.br",
-    "lavoriinitalia.com"
-    // "cincosete.com"
+    "lavoriinitalia.com",
+    "promo.dopeaaps.com"
+    // "cincosete.com",
 ];
 
 export const domains_db = [
