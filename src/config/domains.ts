@@ -8,7 +8,8 @@ export const domains = [
     "informanoticia.com",
     "buscaapp.com.br",
     "lavoriinitalia.com",
-    "promo.dopeaaps.com"
+    "promo.dopeaaps.com",
+    "promo.appmobile4u.com",
     // "cincosete.com",
 ];
 

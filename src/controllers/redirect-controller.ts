@@ -413,7 +413,7 @@ export class RedirectController {
             }
 
             // Dominios que NAO usam prefixo de idioma (vao "brutos")
-            const noLangPrefixDomains = ['promo.dopeaaps.com'];
+            const noLangPrefixDomains = ['promo.dopeaaps.com',"promo.appmobile4u.com"];
 
             // Dominios com logica invertida de idioma
             const invertedLangDomains = ['appmobile4u.com', 'appcombos.com', 'informanoticia.com', 'buscaapp.com.br', 'lavoriinitalia.com'
