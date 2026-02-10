@@ -31,5 +31,18 @@ export function createRedirectRouter(db?: Db): Router {
     controller.getRedirectLinks(req, res)
   );
 
+  // Rotas para regras de redirecionamento condicional
+  router.get('/rules', (req, res) =>
+    controller.listRules(req, res)
+  );
+
+  router.post('/rules', (req, res) =>
+    controller.createRule(req, res)
+  );
+
+  router.delete('/rules/:id', (req, res) =>
+    controller.deleteRule(req, res)
+  );
+
   return router;
 }

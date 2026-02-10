@@ -21,6 +21,18 @@ interface BestLinkMap {
     };
 }
 
+/**
+ * Interface para regras de redirecionamento condicional
+ */
+interface RedirectRule {
+    id: string;
+    conditions: { [key: string]: string };
+    destination: string;
+    passQueryParams: boolean;
+    active: boolean;
+    description: string;
+}
+
 export class RedirectController {
     private superFilterService: SuperFilterService;
     private gamAdUnitRepository?: GamAdUnitRepository;
@@ -37,6 +49,9 @@ export class RedirectController {
     private readonly DOMAIN_DB_COUNTER_KEY = 'redirect:domain_db:counter';
     private readonly BEST_LINKS_MAP_DB_KEY = 'redirect:best_links_map_db';
 
+    // Chave Redis para regras de redirecionamento
+    private readonly REDIRECT_RULES_KEY = 'redirect:rules';
+
     // Cache em memória para evitar chamadas repetidas ao Redis
     private bestLinksMapCache: BestLinkMap | null = null;
     private bestLinksMapCacheTime: number = 0;
@@ -45,6 +60,10 @@ export class RedirectController {
     // Cache em memória para domains_db
     private bestLinksMapDbCache: BestLinkMap | null = null;
     private bestLinksMapDbCacheTime: number = 0;
+
+    // Cache em memória para regras de redirecionamento
+    private rulesCache: RedirectRule[] | null = null;
+    private rulesCacheTime: number = 0;
 
     constructor(db?: Db) {
         this.superFilterService = new SuperFilterService();
@@ -349,6 +368,126 @@ export class RedirectController {
     }
 
     /**
+     * Obtem as regras de redirecionamento do cache (com cache em memória)
+     */
+    private async getRules(): Promise<RedirectRule[]> {
+        try {
+            const now = Date.now();
+            if (this.rulesCache && (now - this.rulesCacheTime) < this.CACHE_TTL_MS) {
+                return this.rulesCache;
+            }
+
+            if (!this.redisClient) return this.rulesCache || [];
+
+            const cached = await this.redisClient.get(this.REDIRECT_RULES_KEY);
+            if (cached) {
+                this.rulesCache = JSON.parse(cached) as RedirectRule[];
+                this.rulesCacheTime = now;
+                return this.rulesCache;
+            }
+            return [];
+        } catch (error) {
+            console.error('Error getting redirect rules:', error);
+            return this.rulesCache || [];
+        }
+    }
+
+    /**
+     * Salva as regras no Redis e invalida o cache em memória
+     */
+    private async saveRules(rules: RedirectRule[]): Promise<void> {
+        if (!this.redisClient) return;
+        await this.redisClient.set(this.REDIRECT_RULES_KEY, JSON.stringify(rules));
+        this.rulesCache = rules;
+        this.rulesCacheTime = Date.now();
+    }
+
+    /**
+     * Verifica se uma requisição bate com alguma regra ativa
+     */
+    private matchRule(query: Record<string, any>, rules: RedirectRule[]): RedirectRule | null {
+        for (const rule of rules) {
+            if (!rule.active) continue;
+
+            const allMatch = Object.entries(rule.conditions).every(
+                ([key, value]) => String(query[key] || '') === value
+            );
+
+            if (allMatch) return rule;
+        }
+        return null;
+    }
+
+    /**
+     * GET /api/rules — listar regras
+     */
+    public async listRules(_req: Request, res: Response): Promise<void> {
+        try {
+            const rules = await this.getRules();
+            res.status(200).json({ rules });
+        } catch (error) {
+            console.error('Error listing rules:', error);
+            res.status(500).json({ error: 'Failed to list rules' });
+        }
+    }
+
+    /**
+     * POST /api/rules — criar regra
+     */
+    public async createRule(req: Request, res: Response): Promise<void> {
+        try {
+            const { conditions, destination, passQueryParams, description } = req.body;
+
+            if (!conditions || !destination) {
+                res.status(400).json({ error: 'conditions e destination são obrigatórios' });
+                return;
+            }
+
+            const rule: RedirectRule = {
+                id: `${Date.now()}_${Math.random().toString(36).substring(2, 8)}`,
+                conditions,
+                destination,
+                passQueryParams: passQueryParams !== false,
+                active: true,
+                description: description || ''
+            };
+
+            const rules = await this.getRules();
+            rules.push(rule);
+            await this.saveRules(rules);
+
+            console.log(`[RULE CREATED] ${rule.id}: ${JSON.stringify(rule.conditions)} -> ${rule.destination}`);
+            res.status(201).json({ rule });
+        } catch (error) {
+            console.error('Error creating rule:', error);
+            res.status(500).json({ error: 'Failed to create rule' });
+        }
+    }
+
+    /**
+     * DELETE /api/rules/:id — remover regra
+     */
+    public async deleteRule(req: Request, res: Response): Promise<void> {
+        try {
+            const { id } = req.params;
+            const rules = await this.getRules();
+            const filtered = rules.filter(r => r.id !== id);
+
+            if (filtered.length === rules.length) {
+                res.status(404).json({ error: 'Rule not found' });
+                return;
+            }
+
+            await this.saveRules(filtered);
+            console.log(`[RULE DELETED] ${id}`);
+            res.status(200).json({ message: 'Rule deleted' });
+        } catch (error) {
+            console.error('Error deleting rule:', error);
+            res.status(500).json({ error: 'Failed to delete rule' });
+        }
+    }
+
+    /**
      * Redirect principal com nova logica:
      * - Rotaciona dominios sequencialmente
      * - Se visitante ja viu o dominio naquela hora -> /random
@@ -358,6 +497,22 @@ export class RedirectController {
         try {
             if (req.path.includes('favicon') || req.url.includes('favicon')) {
                 res.status(204).end();
+                return;
+            }
+
+            // Verificar regras de redirecionamento condicional
+            const rules = await this.getRules();
+            const matchedRule = this.matchRule(req.query, rules);
+
+            if (matchedRule) {
+                const ruleUrl = new URL(matchedRule.destination);
+                if (matchedRule.passQueryParams) {
+                    for (const [key, value] of Object.entries(req.query)) {
+                        if (value) ruleUrl.searchParams.append(key, String(value));
+                    }
+                }
+                console.log(`[RULE REDIRECT] ${matchedRule.id} (${matchedRule.description}) -> ${ruleUrl.toString()}`);
+                res.redirect(ruleUrl.toString());
                 return;
             }
 

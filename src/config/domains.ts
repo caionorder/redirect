@@ -10,13 +10,23 @@ export const domains = [
     "lavoriinitalia.com",
     "promo.dopeaaps.com",
     "promo.appmobile4u.com",
+    "finance.dopeaaps.com",
+    "finance.appmobile4u.com",
     // "cincosete.com",
 ];
 
 export const domains_db = [
-    "appmynews.com",
-    "hoteltyp.com"
-    // "ghcconnect.com"
+    // "appmynews.com",
+    // "hoteltyp.com",
+    // "ghcconnect.com",
+    "forexmania.club",
+    "netseguro.tech",
+    "techerdowns.com",
+    "magazinepremier.com.br",
+    "creditoclube.com.br",
+    "dicasdocartao.com.br",
+    "superfatos.com.br",
+    "opelfrance.club"
 ];
 
 
