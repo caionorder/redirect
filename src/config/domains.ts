@@ -22,11 +22,8 @@ export const domains_db = [
     "forexmania.club",
     "netseguro.tech",
     "techerdowns.com",
-    "magazinepremier.com.br",
     "creditoclube.com.br",
-    "dicasdocartao.com.br",
-    "superfatos.com.br",
-    "opelfrance.club"
+    "dicasdocartao.com.br"
 ];
 
 

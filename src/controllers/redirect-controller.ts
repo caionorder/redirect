@@ -33,6 +33,19 @@ interface RedirectRule {
     description: string;
 }
 
+/**
+ * Interface para regras de redirecionamento fora do in-app browser
+ * Se o usuario NAO esta no in-app (Facebook/Instagram) e a utm_campaign bate, redireciona
+ */
+interface InAppRule {
+    id: string;
+    utm_campaign: string;
+    destination: string;
+    passQueryParams: boolean;
+    active: boolean;
+    description: string;
+}
+
 export class RedirectController {
     private superFilterService: SuperFilterService;
     private gamAdUnitRepository?: GamAdUnitRepository;
@@ -52,6 +65,9 @@ export class RedirectController {
     // Chave Redis para regras de redirecionamento
     private readonly REDIRECT_RULES_KEY = 'redirect:rules';
 
+    // Chave Redis para regras de in-app
+    private readonly INAPP_RULES_KEY = 'redirect:inapp_rules';
+
     // Cache em memória para evitar chamadas repetidas ao Redis
     private bestLinksMapCache: BestLinkMap | null = null;
     private bestLinksMapCacheTime: number = 0;
@@ -64,6 +80,10 @@ export class RedirectController {
     // Cache em memória para regras de redirecionamento
     private rulesCache: RedirectRule[] | null = null;
     private rulesCacheTime: number = 0;
+
+    // Cache em memória para regras de in-app
+    private inAppRulesCache: InAppRule[] | null = null;
+    private inAppRulesCacheTime: number = 0;
 
     constructor(db?: Db) {
         this.superFilterService = new SuperFilterService();
@@ -487,6 +507,121 @@ export class RedirectController {
         }
     }
 
+    // ========== IN-APP RULES ==========
+
+    /**
+     * Detecta se o User-Agent é do navegador in-app do Facebook/Instagram
+     */
+    private isInAppBrowser(userAgent: string): boolean {
+        return userAgent.includes('FBAN') || userAgent.includes('FBAV') ||
+               userAgent.includes('Instagram');
+    }
+
+    /**
+     * Obtem as regras de in-app do cache (com cache em memória)
+     */
+    private async getInAppRules(): Promise<InAppRule[]> {
+        try {
+            const now = Date.now();
+            if (this.inAppRulesCache && (now - this.inAppRulesCacheTime) < this.CACHE_TTL_MS) {
+                return this.inAppRulesCache;
+            }
+
+            if (!this.redisClient) return this.inAppRulesCache || [];
+
+            const cached = await this.redisClient.get(this.INAPP_RULES_KEY);
+            if (cached) {
+                this.inAppRulesCache = JSON.parse(cached) as InAppRule[];
+                this.inAppRulesCacheTime = now;
+                return this.inAppRulesCache;
+            }
+            return [];
+        } catch (error) {
+            console.error('Error getting in-app rules:', error);
+            return this.inAppRulesCache || [];
+        }
+    }
+
+    /**
+     * Salva as regras de in-app no Redis e invalida o cache
+     */
+    private async saveInAppRules(rules: InAppRule[]): Promise<void> {
+        if (!this.redisClient) return;
+        await this.redisClient.set(this.INAPP_RULES_KEY, JSON.stringify(rules));
+        this.inAppRulesCache = rules;
+        this.inAppRulesCacheTime = Date.now();
+    }
+
+    /**
+     * GET /api/inapp-rules — listar regras de in-app
+     */
+    public async listInAppRules(_req: Request, res: Response): Promise<void> {
+        try {
+            const rules = await this.getInAppRules();
+            res.status(200).json({ rules });
+        } catch (error) {
+            console.error('Error listing in-app rules:', error);
+            res.status(500).json({ error: 'Failed to list in-app rules' });
+        }
+    }
+
+    /**
+     * POST /api/inapp-rules — criar regra de in-app
+     * Body: { utm_campaign, destination, passQueryParams?, description? }
+     */
+    public async createInAppRule(req: Request, res: Response): Promise<void> {
+        try {
+            const { utm_campaign, destination, passQueryParams, description } = req.body;
+
+            if (!utm_campaign || !destination) {
+                res.status(400).json({ error: 'utm_campaign e destination são obrigatórios' });
+                return;
+            }
+
+            const rule: InAppRule = {
+                id: `${Date.now()}_${Math.random().toString(36).substring(2, 8)}`,
+                utm_campaign,
+                destination,
+                passQueryParams: passQueryParams !== false,
+                active: true,
+                description: description || ''
+            };
+
+            const rules = await this.getInAppRules();
+            rules.push(rule);
+            await this.saveInAppRules(rules);
+
+            console.log(`[INAPP RULE CREATED] ${rule.id}: utm_campaign=${rule.utm_campaign} -> ${rule.destination}`);
+            res.status(201).json({ rule });
+        } catch (error) {
+            console.error('Error creating in-app rule:', error);
+            res.status(500).json({ error: 'Failed to create in-app rule' });
+        }
+    }
+
+    /**
+     * DELETE /api/inapp-rules/:id — remover regra de in-app
+     */
+    public async deleteInAppRule(req: Request, res: Response): Promise<void> {
+        try {
+            const { id } = req.params;
+            const rules = await this.getInAppRules();
+            const filtered = rules.filter(r => r.id !== id);
+
+            if (filtered.length === rules.length) {
+                res.status(404).json({ error: 'In-app rule not found' });
+                return;
+            }
+
+            await this.saveInAppRules(filtered);
+            console.log(`[INAPP RULE DELETED] ${id}`);
+            res.status(200).json({ message: 'In-app rule deleted' });
+        } catch (error) {
+            console.error('Error deleting in-app rule:', error);
+            res.status(500).json({ error: 'Failed to delete in-app rule' });
+        }
+    }
+
     /**
      * Redirect principal com nova logica:
      * - Rotaciona dominios sequencialmente
@@ -514,6 +649,28 @@ export class RedirectController {
                 console.log(`[RULE REDIRECT] ${matchedRule.id} (${matchedRule.description}) -> ${ruleUrl.toString()}`);
                 res.redirect(ruleUrl.toString());
                 return;
+            }
+
+            // Verificar regras de in-app: se NAO esta no in-app e tem utm_campaign cadastrada, redireciona
+            const utmCampaign = req.query.utm_campaign as string;
+            if (utmCampaign) {
+                const userAgent = req.headers['user-agent'] || '';
+                if (!this.isInAppBrowser(userAgent)) {
+                    const inAppRules = await this.getInAppRules();
+                    const inAppMatch = inAppRules.find(r => r.active && r.utm_campaign === utmCampaign);
+
+                    if (inAppMatch) {
+                        const inAppUrl = new URL(inAppMatch.destination);
+                        if (inAppMatch.passQueryParams) {
+                            for (const [key, value] of Object.entries(req.query)) {
+                                if (value) inAppUrl.searchParams.append(key, String(value));
+                            }
+                        }
+                        console.log(`[NOT-INAPP REDIRECT] ${inAppMatch.id} campaign=${utmCampaign} -> ${inAppUrl.toString()}`);
+                        res.redirect(inAppUrl.toString());
+                        return;
+                    }
+                }
             }
 
             // Identificar visitante por IP
@@ -653,6 +810,28 @@ export class RedirectController {
             if (domains_db.length === 0) {
                 res.status(503).json({ error: 'No domains_db configured' });
                 return;
+            }
+
+            // Verificar regras de in-app: se NAO esta no in-app e tem utm_campaign cadastrada, redireciona
+            const utmCampaignDb = req.query.utm_campaign as string;
+            if (utmCampaignDb) {
+                const userAgent = req.headers['user-agent'] || '';
+                if (!this.isInAppBrowser(userAgent)) {
+                    const inAppRules = await this.getInAppRules();
+                    const inAppMatch = inAppRules.find(r => r.active && r.utm_campaign === utmCampaignDb);
+
+                    if (inAppMatch) {
+                        const inAppUrl = new URL(inAppMatch.destination);
+                        if (inAppMatch.passQueryParams) {
+                            for (const [key, value] of Object.entries(req.query)) {
+                                if (value) inAppUrl.searchParams.append(key, String(value));
+                            }
+                        }
+                        console.log(`[NOT-INAPP REDIRECT DB] ${inAppMatch.id} campaign=${utmCampaignDb} -> ${inAppUrl.toString()}`);
+                        res.redirect(inAppUrl.toString());
+                        return;
+                    }
+                }
             }
 
             // Identificar visitante por IP

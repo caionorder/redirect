@@ -44,5 +44,18 @@ export function createRedirectRouter(db?: Db): Router {
     controller.deleteRule(req, res)
   );
 
+  // Rotas para regras de in-app browser
+  router.get('/inapp-rules', (req, res) =>
+    controller.listInAppRules(req, res)
+  );
+
+  router.post('/inapp-rules', (req, res) =>
+    controller.createInAppRule(req, res)
+  );
+
+  router.delete('/inapp-rules/:id', (req, res) =>
+    controller.deleteInAppRule(req, res)
+  );
+
   return router;
 }
