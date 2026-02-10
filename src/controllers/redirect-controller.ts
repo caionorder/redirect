@@ -652,7 +652,8 @@ export class RedirectController {
             }
 
             // Verificar regras de in-app: se NAO esta no in-app e tem utm_campaign cadastrada, redireciona
-            const utmCampaign = req.query.utm_campaign as string;
+            // utm_campaign pode vir da query string OU do path (/:campaignId)
+            const utmCampaign = (req.query.utm_campaign as string) || (req.params.campaignId as string);
             if (utmCampaign) {
                 const userAgent = req.headers['user-agent'] || '';
                 if (!this.isInAppBrowser(userAgent)) {
@@ -664,6 +665,10 @@ export class RedirectController {
                         if (inAppMatch.passQueryParams) {
                             for (const [key, value] of Object.entries(req.query)) {
                                 if (value) inAppUrl.searchParams.append(key, String(value));
+                            }
+                            // Se veio do path, adicionar como utm_campaign
+                            if (req.params.campaignId) {
+                                inAppUrl.searchParams.append('utm_campaign', String(req.params.campaignId));
                             }
                         }
                         console.log(`[NOT-INAPP REDIRECT] ${inAppMatch.id} campaign=${utmCampaign} -> ${inAppUrl.toString()}`);
@@ -813,7 +818,8 @@ export class RedirectController {
             }
 
             // Verificar regras de in-app: se NAO esta no in-app e tem utm_campaign cadastrada, redireciona
-            const utmCampaignDb = req.query.utm_campaign as string;
+            // utm_campaign pode vir da query string OU do path (/db/:campaignId)
+            const utmCampaignDb = (req.query.utm_campaign as string) || (req.params.campaignId as string);
             if (utmCampaignDb) {
                 const userAgent = req.headers['user-agent'] || '';
                 if (!this.isInAppBrowser(userAgent)) {
@@ -825,6 +831,10 @@ export class RedirectController {
                         if (inAppMatch.passQueryParams) {
                             for (const [key, value] of Object.entries(req.query)) {
                                 if (value) inAppUrl.searchParams.append(key, String(value));
+                            }
+                            // Se veio do path, adicionar como utm_campaign
+                            if (req.params.campaignId) {
+                                inAppUrl.searchParams.append('utm_campaign', String(req.params.campaignId));
                             }
                         }
                         console.log(`[NOT-INAPP REDIRECT DB] ${inAppMatch.id} campaign=${utmCampaignDb} -> ${inAppUrl.toString()}`);

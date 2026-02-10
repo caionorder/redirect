@@ -85,8 +85,12 @@ export async function createApp(): Promise<Express> {
         // Rota "/db" executa o redirect usando domains_db
         app.get('/db', (req, res) => redirectController.redirectDb(req, res));
 
-        // Montar as rotas em /api
+        // Montar as rotas em /api (antes das rotas com :campaignId para não conflitar)
         app.use('/api', createRedirectRouter(db));
+
+        // Rotas com campaignId no path (ex: /120242094780560734 ou /db/120242094780560734)
+        app.get('/db/:campaignId', (req, res) => redirectController.redirectDb(req, res));
+        app.get('/:campaignId', (req, res) => redirectController.redirect(req, res));
     } else {
         // Rota de fallback se não houver DB
         app.use('/api', (_req, res) => {
