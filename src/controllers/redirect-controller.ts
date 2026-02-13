@@ -518,6 +518,41 @@ export class RedirectController {
     }
 
     /**
+     * Gera HTML com iframe fullscreen apontando para a URL de destino
+     */
+    private generateIframeHtml(url: string): string {
+        return `<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Carregando...</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        html, body {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+        }
+        iframe {
+            width: 100%;
+            height: 100%;
+            border: none;
+            display: block;
+        }
+    </style>
+</head>
+<body>
+    <iframe src="${url}" allowfullscreen></iframe>
+</body>
+</html>`;
+    }
+
+    /**
      * Obtem as regras de in-app do cache (com cache em memória)
      */
     private async getInAppRules(): Promise<InAppRule[]> {
@@ -651,30 +686,40 @@ export class RedirectController {
                 return;
             }
 
-            // Verificar regras de in-app: se NAO esta no in-app e tem utm_campaign cadastrada, redireciona
+            // Verificar regras de in-app/iframe
             // utm_campaign pode vir da query string OU do path (/:campaignId)
             const utmCampaign = (req.query.utm_campaign as string) || (req.params.campaignId as string);
+            console.log(`[DEBUG INAPP] campaignId=${req.params?.campaignId} utmCampaign=${utmCampaign} path=${req.path}`);
             if (utmCampaign) {
-                const userAgent = req.headers['user-agent'] || '';
-                if (!this.isInAppBrowser(userAgent)) {
-                    const inAppRules = await this.getInAppRules();
-                    const inAppMatch = inAppRules.find(r => r.active && r.utm_campaign === utmCampaign);
+                const inAppRules = await this.getInAppRules();
+                console.log(`[DEBUG INAPP] rules count=${inAppRules.length} rules=${JSON.stringify(inAppRules.map(r => ({ id: r.id, utm_campaign: r.utm_campaign, active: r.active })))}`);
+                const inAppMatch = inAppRules.find(r => r.active && r.utm_campaign === utmCampaign);
 
-                    if (inAppMatch) {
-                        const inAppUrl = new URL(inAppMatch.destination);
-                        if (inAppMatch.passQueryParams) {
-                            for (const [key, value] of Object.entries(req.query)) {
-                                if (value) inAppUrl.searchParams.append(key, String(value));
-                            }
-                            // Se veio do path, adicionar como utm_campaign
-                            if (req.params.campaignId) {
-                                inAppUrl.searchParams.append('utm_campaign', String(req.params.campaignId));
-                            }
+                if (inAppMatch) {
+                    const inAppUrl = new URL(inAppMatch.destination);
+                    if (inAppMatch.passQueryParams) {
+                        for (const [key, value] of Object.entries(req.query)) {
+                            if (value) inAppUrl.searchParams.append(key, String(value));
                         }
-                        console.log(`[NOT-INAPP REDIRECT] ${inAppMatch.id} campaign=${utmCampaign} -> ${inAppUrl.toString()}`);
-                        res.redirect(inAppUrl.toString());
-                        return;
+                        // Se veio do path, adicionar como utm_campaign
+                        if (req.params.campaignId) {
+                            inAppUrl.searchParams.append('utm_campaign', String(req.params.campaignId));
+                        }
                     }
+                    const finalUrl = inAppUrl.toString();
+                    const userAgent = req.headers['user-agent'] || '';
+                    const isInApp = this.isInAppBrowser(userAgent);
+
+                    if (isInApp) {
+                        // In-app (Facebook/Instagram) -> redirect para destino
+                        console.log(`[INAPP REDIRECT] ${inAppMatch.id} campaign=${utmCampaign} -> ${finalUrl}`);
+                        res.redirect(finalUrl);
+                    } else {
+                        // Não é in-app (Meta crawler, navegador normal) -> iframe
+                        console.log(`[IFRAME] ${inAppMatch.id} campaign=${utmCampaign} -> ${finalUrl}`);
+                        res.send(this.generateIframeHtml(finalUrl));
+                    }
+                    return;
                 }
             }
 
@@ -817,30 +862,38 @@ export class RedirectController {
                 return;
             }
 
-            // Verificar regras de in-app: se NAO esta no in-app e tem utm_campaign cadastrada, redireciona
+            // Verificar regras de in-app/iframe
             // utm_campaign pode vir da query string OU do path (/db/:campaignId)
             const utmCampaignDb = (req.query.utm_campaign as string) || (req.params.campaignId as string);
             if (utmCampaignDb) {
-                const userAgent = req.headers['user-agent'] || '';
-                if (!this.isInAppBrowser(userAgent)) {
-                    const inAppRules = await this.getInAppRules();
-                    const inAppMatch = inAppRules.find(r => r.active && r.utm_campaign === utmCampaignDb);
+                const inAppRules = await this.getInAppRules();
+                const inAppMatch = inAppRules.find(r => r.active && r.utm_campaign === utmCampaignDb);
 
-                    if (inAppMatch) {
-                        const inAppUrl = new URL(inAppMatch.destination);
-                        if (inAppMatch.passQueryParams) {
-                            for (const [key, value] of Object.entries(req.query)) {
-                                if (value) inAppUrl.searchParams.append(key, String(value));
-                            }
-                            // Se veio do path, adicionar como utm_campaign
-                            if (req.params.campaignId) {
-                                inAppUrl.searchParams.append('utm_campaign', String(req.params.campaignId));
-                            }
+                if (inAppMatch) {
+                    const inAppUrl = new URL(inAppMatch.destination);
+                    if (inAppMatch.passQueryParams) {
+                        for (const [key, value] of Object.entries(req.query)) {
+                            if (value) inAppUrl.searchParams.append(key, String(value));
                         }
-                        console.log(`[NOT-INAPP REDIRECT DB] ${inAppMatch.id} campaign=${utmCampaignDb} -> ${inAppUrl.toString()}`);
-                        res.redirect(inAppUrl.toString());
-                        return;
+                        // Se veio do path, adicionar como utm_campaign
+                        if (req.params.campaignId) {
+                            inAppUrl.searchParams.append('utm_campaign', String(req.params.campaignId));
+                        }
                     }
+                    const finalUrl = inAppUrl.toString();
+                    const userAgent = req.headers['user-agent'] || '';
+                    const isInApp = this.isInAppBrowser(userAgent);
+
+                    if (isInApp) {
+                        // In-app (Facebook/Instagram) -> redirect para destino
+                        console.log(`[INAPP REDIRECT DB] ${inAppMatch.id} campaign=${utmCampaignDb} -> ${finalUrl}`);
+                        res.redirect(finalUrl);
+                    } else {
+                        // Não é in-app (Meta crawler, navegador normal) -> iframe
+                        console.log(`[IFRAME DB] ${inAppMatch.id} campaign=${utmCampaignDb} -> ${finalUrl}`);
+                        res.send(this.generateIframeHtml(finalUrl));
+                    }
+                    return;
                 }
             }
 

@@ -11,12 +11,27 @@ import { createRedirectRouter } from './routes/redirect-route';
 import { RedirectController } from './controllers/redirect-controller';
 import { errorHandler } from './middleware/error-handler';
 import { Db } from 'mongodb';
+import { domains, domains_db } from './config/domains';
 
 export async function createApp(): Promise<Express> {
     const app = express();
 
+    // Gerar frame-src dinamicamente a partir dos domínios configurados
+    const allDomains = [...domains, ...domains_db];
+    const frameSrcDomains = allDomains.flatMap(d => [`https://${d}`, `https://*.${d}`]);
+
     // Configurações de segurança
-    app.use(helmet());
+    app.use(helmet({
+        contentSecurityPolicy: {
+            directives: {
+                defaultSrc: ["'self'"],
+                frameSrc: ["'self'", ...frameSrcDomains],
+                frameAncestors: ["'self'"],
+                scriptSrc: ["'self'", "'unsafe-inline'"],
+                styleSrc: ["'self'", "'unsafe-inline'"],
+            }
+        }
+    }));
     app.set('trust proxy', 1);
     app.disable('x-powered-by');
     app.set('etag', false);
