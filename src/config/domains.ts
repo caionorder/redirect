@@ -4,7 +4,7 @@ export const domains = [
     "odiahoje.com",
     "esportesblog.com",
     "appmobile4u.com",
-    // "appcombos.com",
+    "appcombos.com",
     "informanoticia.com",
     "buscaapp.com.br",
     "lavoriinitalia.com",
@@ -12,7 +12,7 @@ export const domains = [
     "promo.appmobile4u.com",
     "finance.dopeaaps.com",
     "finance.appmobile4u.com",
-    // "cincosete.com",
+    "cincosete.com",
 ];
 
 export const domains_db = [

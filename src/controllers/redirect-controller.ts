@@ -11,14 +11,19 @@ import { redis } from '../config/redis';
 import { generateRandomPath, domains, domains_db } from '../config/domains';
 
 /**
- * Interface para o mapa de melhores links por dominio
+ * Interface para um link com eCPM
  */
-interface BestLinkMap {
-    [domain: string]: {
-        url: string;
-        postId: string;
-        ecpm: number;
-    };
+interface LinkInfo {
+    url: string;
+    postId: string;
+    ecpm: number;
+}
+
+/**
+ * Interface para o mapa de links rankeados por eCPM (do maior para o menor)
+ */
+interface RankedLinksMap {
+    [domain: string]: LinkInfo[];
 }
 
 /**
@@ -69,12 +74,12 @@ export class RedirectController {
     private readonly INAPP_RULES_KEY = 'redirect:inapp_rules';
 
     // Cache em memória para evitar chamadas repetidas ao Redis
-    private bestLinksMapCache: BestLinkMap | null = null;
+    private bestLinksMapCache: RankedLinksMap | null = null;
     private bestLinksMapCacheTime: number = 0;
     private readonly CACHE_TTL_MS = 60000; // 1 minuto de cache em memória
 
     // Cache em memória para domains_db
-    private bestLinksMapDbCache: BestLinkMap | null = null;
+    private bestLinksMapDbCache: RankedLinksMap | null = null;
     private bestLinksMapDbCacheTime: number = 0;
 
     // Cache em memória para regras de redirecionamento
@@ -102,10 +107,10 @@ export class RedirectController {
     }
 
     /**
-     * Cron: minuto 30 de cada hora - busca melhor eCPM de CADA dominio
+     * Cron: a cada 15 minutos - busca ranking de eCPM de CADA dominio
      */
     private initializeScheduledProcess(): void {
-        console.log('[CRON] Inicializando agendamento - executará no minuto 30 de cada hora');
+        console.log('[CRON] Inicializando agendamento - executará a cada 15 minutos');
 
         // Executar imediatamente na inicialização para popular o cache
         this.executeProcessInternal()
@@ -117,8 +122,8 @@ export class RedirectController {
             .then(() => console.log('[CRON] Cache inicial DB populado com sucesso'))
             .catch(err => console.error('[CRON] Erro ao popular cache inicial DB:', err));
 
-        // Agendar para rodar no minuto 30
-        const task = cron.schedule('30 * * * *', async () => {
+        // Agendar para rodar a cada 15 minutos
+        const task = cron.schedule('*/15 * * * *', async () => {
             console.log('[CRON] Executando atualização agendada...');
             try {
                 await this.executeProcessInternal();
@@ -131,10 +136,10 @@ export class RedirectController {
     }
 
     /**
-     * Busca em TODOS os dominios o melhor post (maior eCPM) de CADA dominio
-     * Salva no Redis um mapa: { dominio: melhor_url }
+     * Busca em TODOS os dominios os posts rankeados por eCPM (do maior para o menor)
+     * Salva no Redis um mapa: { dominio: [{ url, postId, ecpm }, ...] }
      */
-    private async executeProcessInternal(): Promise<BestLinkMap | null> {
+    private async executeProcessInternal(): Promise<RankedLinksMap | null> {
         const date = new Date();
         const today = new Date(date.getFullYear(), date.getMonth(), date.getDate());
 
@@ -157,8 +162,8 @@ export class RedirectController {
             return null;
         }
 
-        // Agrupar por dominio e pegar o melhor de cada
-        const bestByDomain: BestLinkMap = {};
+        // Agrupar todos os links por dominio
+        const rankedByDomain: RankedLinksMap = {};
 
         for (const item of data) {
             if (!item.domain || !item.custom_value) continue;
@@ -167,40 +172,46 @@ export class RedirectController {
             const ecpm = parseFloat(String(item.ecpm || 0));
             const postId = String(item.custom_value);
 
-            // Se ainda nao temos esse dominio ou este tem eCPM maior
-            if (!bestByDomain[domain] || ecpm > bestByDomain[domain].ecpm) {
-                bestByDomain[domain] = {
-                    url: `https://${domain}/?p=${encodeURIComponent(postId)}`,
-                    postId: postId,
-                    ecpm: ecpm
-                };
+            if (!rankedByDomain[domain]) {
+                rankedByDomain[domain] = [];
             }
+
+            rankedByDomain[domain].push({
+                url: `https://${domain}/?p=${encodeURIComponent(postId)}`,
+                postId: postId,
+                ecpm: ecpm
+            });
+        }
+
+        // Ordenar cada dominio por eCPM decrescente
+        for (const domain of Object.keys(rankedByDomain)) {
+            rankedByDomain[domain].sort((a, b) => b.ecpm - a.ecpm);
         }
 
         // Salvar no cache Redis (1 hora)
-        if (this.redisClient && Object.keys(bestByDomain).length > 0) {
+        if (this.redisClient && Object.keys(rankedByDomain).length > 0) {
             await this.redisClient.set(
                 this.BEST_LINKS_MAP_KEY,
-                JSON.stringify(bestByDomain),
+                JSON.stringify(rankedByDomain),
                 'EX',
                 3600
             );
-            console.log(`[CRON] Mapa de melhores links atualizado: ${Object.keys(bestByDomain).length} dominios`);
+            console.log(`[CRON] Ranking de links atualizado: ${Object.keys(rankedByDomain).length} dominios`);
         }
 
-        // Log dos melhores links
-        for (const [domain, info] of Object.entries(bestByDomain)) {
-            console.log(`[CRON] ${domain} -> p=${info.postId} (eCPM: ${info.ecpm.toFixed(4)})`);
+        // Log do ranking
+        for (const [domain, links] of Object.entries(rankedByDomain)) {
+            console.log(`[CRON] ${domain} -> ${links.length} links (melhor: p=${links[0].postId} eCPM=${links[0].ecpm.toFixed(4)})`);
         }
 
-        return bestByDomain;
+        return rankedByDomain;
     }
 
     /**
-     * Busca em domains_db o melhor post (maior eCPM) de CADA dominio
-     * Salva no Redis um mapa separado: { dominio: melhor_url }
+     * Busca em domains_db os posts rankeados por eCPM (do maior para o menor)
+     * Salva no Redis um mapa separado: { dominio: [{ url, postId, ecpm }, ...] }
      */
-    private async executeProcessInternalDb(): Promise<BestLinkMap | null> {
+    private async executeProcessInternalDb(): Promise<RankedLinksMap | null> {
         if (domains_db.length === 0) {
             console.log('[CRON-DB] Nenhum domínio configurado em domains_db');
             return null;
@@ -228,8 +239,8 @@ export class RedirectController {
             return null;
         }
 
-        // Agrupar por dominio e pegar o melhor de cada
-        const bestByDomain: BestLinkMap = {};
+        // Agrupar todos os links por dominio
+        const rankedByDomain: RankedLinksMap = {};
 
         for (const item of data) {
             if (!item.domain || !item.custom_value) continue;
@@ -238,33 +249,39 @@ export class RedirectController {
             const ecpm = parseFloat(String(item.ecpm || 0));
             const postId = String(item.custom_value);
 
-            // Se ainda nao temos esse dominio ou este tem eCPM maior
-            if (!bestByDomain[domain] || ecpm > bestByDomain[domain].ecpm) {
-                bestByDomain[domain] = {
-                    url: `https://${domain}/?p=${encodeURIComponent(postId)}`,
-                    postId: postId,
-                    ecpm: ecpm
-                };
+            if (!rankedByDomain[domain]) {
+                rankedByDomain[domain] = [];
             }
+
+            rankedByDomain[domain].push({
+                url: `https://${domain}/?p=${encodeURIComponent(postId)}`,
+                postId: postId,
+                ecpm: ecpm
+            });
+        }
+
+        // Ordenar cada dominio por eCPM decrescente
+        for (const domain of Object.keys(rankedByDomain)) {
+            rankedByDomain[domain].sort((a, b) => b.ecpm - a.ecpm);
         }
 
         // Salvar no cache Redis (1 hora)
-        if (this.redisClient && Object.keys(bestByDomain).length > 0) {
+        if (this.redisClient && Object.keys(rankedByDomain).length > 0) {
             await this.redisClient.set(
                 this.BEST_LINKS_MAP_DB_KEY,
-                JSON.stringify(bestByDomain),
+                JSON.stringify(rankedByDomain),
                 'EX',
                 3600
             );
-            console.log(`[CRON-DB] Mapa de melhores links DB atualizado: ${Object.keys(bestByDomain).length} dominios`);
+            console.log(`[CRON-DB] Ranking de links DB atualizado: ${Object.keys(rankedByDomain).length} dominios`);
         }
 
-        // Log dos melhores links
-        for (const [domain, info] of Object.entries(bestByDomain)) {
-            console.log(`[CRON-DB] ${domain} -> p=${info.postId} (eCPM: ${info.ecpm.toFixed(4)})`);
+        // Log do ranking
+        for (const [domain, links] of Object.entries(rankedByDomain)) {
+            console.log(`[CRON-DB] ${domain} -> ${links.length} links (melhor: p=${links[0].postId} eCPM=${links[0].ecpm.toFixed(4)})`);
         }
 
-        return bestByDomain;
+        return rankedByDomain;
     }
 
     /**
@@ -297,14 +314,20 @@ export class RedirectController {
     }
 
     /**
-     * Verifica se o visitante ja viu o dominio nesta hora
+     * Retorna quantas vezes o visitante ja viu o dominio nesta hora (antes de incrementar)
+     * e incrementa o contador. TTL 1 hora.
      */
-    private async hasVisitorSeenDomain(ip: string, domain: string): Promise<boolean> {
-        if (!this.redisClient) return false;
+    private async getVisitorVisitCount(ip: string, domain: string): Promise<number> {
+        if (!this.redisClient) return 0;
 
         const key = this.getVisitorKey(ip, domain);
-        const seen = await this.redisClient.get(key);
-        return seen !== null;
+        const count = await this.redisClient.incr(key);
+        // Setar TTL apenas na primeira visita (count === 1)
+        if (count === 1) {
+            await this.redisClient.expire(key, 3600);
+        }
+        // count=1 significa primeira visita (index 0), count=2 segunda (index 1), etc.
+        return count - 1;
     }
 
     /**
@@ -338,7 +361,7 @@ export class RedirectController {
     /**
      * Obtem o mapa de melhores links do cache (com cache em memória)
      */
-    private async getBestLinksMap(): Promise<BestLinkMap | null> {
+    private async getBestLinksMap(): Promise<RankedLinksMap | null> {
         try {
             // Verificar cache em memória primeiro
             const now = Date.now();
@@ -350,7 +373,7 @@ export class RedirectController {
 
             const cached = await this.redisClient.get(this.BEST_LINKS_MAP_KEY);
             if (cached) {
-                this.bestLinksMapCache = JSON.parse(cached) as BestLinkMap;
+                this.bestLinksMapCache = JSON.parse(cached) as RankedLinksMap;
                 this.bestLinksMapCacheTime = now;
                 return this.bestLinksMapCache;
             }
@@ -364,7 +387,7 @@ export class RedirectController {
     /**
      * Obtem o mapa de melhores links do cache para domains_db (com cache em memória)
      */
-    private async getBestLinksMapDb(): Promise<BestLinkMap | null> {
+    private async getBestLinksMapDb(): Promise<RankedLinksMap | null> {
         try {
             // Verificar cache em memória primeiro
             const now = Date.now();
@@ -376,7 +399,7 @@ export class RedirectController {
 
             const cached = await this.redisClient.get(this.BEST_LINKS_MAP_DB_KEY);
             if (cached) {
-                this.bestLinksMapDbCache = JSON.parse(cached) as BestLinkMap;
+                this.bestLinksMapDbCache = JSON.parse(cached) as RankedLinksMap;
                 this.bestLinksMapDbCacheTime = now;
                 return this.bestLinksMapDbCache;
             }
@@ -729,48 +752,43 @@ export class RedirectController {
 
             // Obter o proximo dominio na rotacao
             const domain = await this.getNextDomain();
-            const visitorKey = this.getVisitorKey(clientIp, domain);
 
             // Verificar idioma
             const language = req.query.language as string;
 
-            // Verificar se o visitante ja viu este dominio nesta hora
-            const hasSeenDomain = await this.hasVisitorSeenDomain(clientIp, domain);
+            // Contar visitas do visitante neste dominio nesta hora (e incrementar)
+            const visitIndex = await this.getVisitorVisitCount(clientIp, domain);
+
+            // Buscar ranking de links do dominio
+            const rankedLinksMap = await this.getBestLinksMap();
+            const domainLinks = rankedLinksMap?.[domain];
 
             let redirectUrl: string;
             let linkId: string;
             let logType: string;
 
-            if (hasSeenDomain) {
-                // Visitante ja viu este dominio nesta hora -> /random
-                redirectUrl = `https://${domain}${generateRandomPath()}`;
-                linkId = `random_${domain}`;
-                logType = 'RANDOM LINK';
-            } else {
-                // Primeira visita do visitante neste dominio nesta hora -> melhor link
-                const bestLinksMap = await this.getBestLinksMap();
-                const bestLinkInfo = bestLinksMap?.[domain];
-
-                if (bestLinkInfo) {
-                    redirectUrl = bestLinkInfo.url;
-                    linkId = `best_${domain}_${bestLinkInfo.postId}`;
-                    logType = 'BEST LINK';
+            if (domainLinks && domainLinks.length > 0) {
+                if (visitIndex < domainLinks.length) {
+                    // Visita N -> pega o N-esimo melhor eCPM
+                    const linkInfo = domainLinks[visitIndex];
+                    redirectUrl = linkInfo.url;
+                    linkId = `rank${visitIndex}_${domain}_${linkInfo.postId}`;
+                    logType = `RANK #${visitIndex + 1}`;
                 } else {
-                    // Fallback se nao tiver melhor link para este dominio
+                    // Esgotou todos os links do ranking -> /random
                     redirectUrl = `https://${domain}${generateRandomPath()}`;
-                    linkId = `fallback_${domain}`;
+                    linkId = `random_${domain}`;
                     logType = 'RANDOM LINK';
-                    // Debug: mostrar porque caiu no fallback
-                    if (!bestLinksMap) {
-                        console.log(`[DEBUG] bestLinksMap está VAZIO - rode /api/process para popular`);
-                    } else {
-                        console.log(`[DEBUG] Domínio "${domain}" não encontrado no mapa. Domínios disponíveis: ${Object.keys(bestLinksMap).join(', ')}`);
-                    }
                 }
-
-                // Marcar que o visitante viu este dominio (fire and forget)
-                if (this.redisClient) {
-                    this.redisClient.set(visitorKey, '1', 'EX', 3600).catch(() => {});
+            } else {
+                // Sem dados de ranking para este dominio -> /random
+                redirectUrl = `https://${domain}${generateRandomPath()}`;
+                linkId = `fallback_${domain}`;
+                logType = 'RANDOM LINK';
+                if (!rankedLinksMap) {
+                    console.log(`[DEBUG] rankedLinksMap está VAZIO - rode /api/process para popular`);
+                } else {
+                    console.log(`[DEBUG] Domínio "${domain}" não encontrado no ranking. Domínios disponíveis: ${Object.keys(rankedLinksMap).join(', ')}`);
                 }
             }
 
@@ -809,7 +827,7 @@ export class RedirectController {
 
             // Log com informacao de idioma e dominio
             const langInfo = isNoLangDomain ? ' [BRUTO]' : (language ? ` [${language.toUpperCase()}]` : (isInvertedDomain ? ' [EN]' : ''));
-            const visitInfo = hasSeenDomain ? ' (revisita)' : ' (1a visita)';
+            const visitInfo = ` (visita #${visitIndex + 1})`;
             console.log(`[${logType}]${langInfo} ${domain}${visitInfo} -> ${redirectUrl}`);
 
             // UTM params
@@ -903,52 +921,47 @@ export class RedirectController {
 
             // Obter o proximo dominio na rotacao (domains_db)
             const domain = await this.getNextDomainDb();
-            const visitorKey = this.getVisitorKey(clientIp, domain);
 
-            // Verificar se o visitante ja viu este dominio nesta hora
-            const hasSeenDomain = await this.hasVisitorSeenDomain(clientIp, domain);
+            // Contar visitas do visitante neste dominio nesta hora (e incrementar)
+            const visitIndex = await this.getVisitorVisitCount(clientIp, domain);
+
+            // Buscar ranking de links do dominio
+            const rankedLinksMap = await this.getBestLinksMapDb();
+            const domainLinks = rankedLinksMap?.[domain];
 
             let redirectUrl: string;
             let linkId: string;
             let logType: string;
 
-            if (hasSeenDomain) {
-                // Visitante ja viu este dominio nesta hora -> /random
-                redirectUrl = `https://${domain}${generateRandomPath()}`;
-                linkId = `random_db_${domain}`;
-                logType = 'RANDOM LINK DB';
-            } else {
-                // Primeira visita do visitante neste dominio nesta hora -> melhor link
-                const bestLinksMap = await this.getBestLinksMapDb();
-                const bestLinkInfo = bestLinksMap?.[domain];
-
-                if (bestLinkInfo) {
-                    redirectUrl = bestLinkInfo.url;
-                    linkId = `best_db_${domain}_${bestLinkInfo.postId}`;
-                    logType = 'BEST LINK DB';
+            if (domainLinks && domainLinks.length > 0) {
+                if (visitIndex < domainLinks.length) {
+                    // Visita N -> pega o N-esimo melhor eCPM
+                    const linkInfo = domainLinks[visitIndex];
+                    redirectUrl = linkInfo.url;
+                    linkId = `rank${visitIndex}_db_${domain}_${linkInfo.postId}`;
+                    logType = `RANK #${visitIndex + 1} DB`;
                 } else {
-                    // Fallback se nao tiver melhor link para este dominio
+                    // Esgotou todos os links do ranking -> /random
                     redirectUrl = `https://${domain}${generateRandomPath()}`;
-                    linkId = `fallback_db_${domain}`;
+                    linkId = `random_db_${domain}`;
                     logType = 'RANDOM LINK DB';
-                    // Debug: mostrar porque caiu no fallback
-                    if (!bestLinksMap) {
-                        console.log(`[DEBUG-DB] bestLinksMapDb está VAZIO - rode /api/process para popular`);
-                    } else {
-                        console.log(`[DEBUG-DB] Domínio "${domain}" não encontrado no mapa DB. Domínios disponíveis: ${Object.keys(bestLinksMap).join(', ')}`);
-                    }
                 }
-
-                // Marcar que o visitante viu este dominio (fire and forget)
-                if (this.redisClient) {
-                    this.redisClient.set(visitorKey, '1', 'EX', 3600).catch(() => {});
+            } else {
+                // Sem dados de ranking para este dominio -> /random
+                redirectUrl = `https://${domain}${generateRandomPath()}`;
+                linkId = `fallback_db_${domain}`;
+                logType = 'RANDOM LINK DB';
+                if (!rankedLinksMap) {
+                    console.log(`[DEBUG-DB] rankedLinksMap está VAZIO - rode /api/process para popular`);
+                } else {
+                    console.log(`[DEBUG-DB] Domínio "${domain}" não encontrado no ranking DB. Domínios disponíveis: ${Object.keys(rankedLinksMap).join(', ')}`);
                 }
             }
 
             // domains_db não usa prefixo de idioma (/en/, /es/, etc)
 
             // Log
-            const visitInfo = hasSeenDomain ? ' (revisita)' : ' (1a visita)';
+            const visitInfo = ` (visita #${visitIndex + 1})`;
             console.log(`[${logType}] ${domain}${visitInfo} -> ${redirectUrl}`);
 
             // UTM params
