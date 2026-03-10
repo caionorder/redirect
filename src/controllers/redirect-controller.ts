@@ -87,6 +87,11 @@ export class RedirectController {
     private inAppRulesCache: InAppRule[] | null = null;
     private inAppRulesCacheTime: number = 0;
 
+    // Cache em memória para posts válidos por domínio { domain: Set<postId> }
+    private validPostsCache: Map<string, Set<string>> = new Map();
+    private validPostsCacheTime: number = 0;
+    private readonly VALID_POSTS_CACHE_TTL_MS = 900000; // 15 minutos
+
     constructor(db?: Db) {
         this.superFilterService = new SuperFilterService();
         this.redisClient = redis;
@@ -187,24 +192,27 @@ export class RedirectController {
         // Ordenar por eCPM decrescente (ranking global)
         globalRanking.sort((a, b) => b.ecpm - a.ecpm);
 
+        // Validar posts via API WordPress (remover posts inexistentes)
+        const validatedRanking = await this.validateRanking(globalRanking);
+
         // Salvar no cache Redis (1 hora)
-        if (this.redisClient && globalRanking.length > 0) {
+        if (this.redisClient && validatedRanking.length > 0) {
             await this.redisClient.set(
                 this.BEST_LINKS_MAP_KEY,
-                JSON.stringify(globalRanking),
+                JSON.stringify(validatedRanking),
                 'EX',
                 3600
             );
-            console.log(`[CRON] Ranking global atualizado: ${globalRanking.length} links (${skipped} ignorados por <1000 impressões)`);
+            console.log(`[CRON] Ranking global atualizado: ${validatedRanking.length} links (${skipped} ignorados por <1000 impressões)`);
         }
 
         // Log do top 5
-        const top = globalRanking.slice(0, 5);
+        const top = validatedRanking.slice(0, 5);
         for (let i = 0; i < top.length; i++) {
             console.log(`[CRON] #${i + 1} ${top[i].domain} p=${top[i].postId} (eCPM: ${top[i].ecpm.toFixed(4)})`);
         }
 
-        return globalRanking;
+        return validatedRanking;
     }
 
     /**
@@ -268,24 +276,141 @@ export class RedirectController {
         // Ordenar por eCPM decrescente (ranking global)
         globalRanking.sort((a, b) => b.ecpm - a.ecpm);
 
+        // Validar posts via API WordPress (remover posts inexistentes)
+        const validatedRanking = await this.validateRanking(globalRanking);
+
         // Salvar no cache Redis (1 hora)
-        if (this.redisClient && globalRanking.length > 0) {
+        if (this.redisClient && validatedRanking.length > 0) {
             await this.redisClient.set(
                 this.BEST_LINKS_MAP_DB_KEY,
-                JSON.stringify(globalRanking),
+                JSON.stringify(validatedRanking),
                 'EX',
                 3600
             );
-            console.log(`[CRON-DB] Ranking global DB atualizado: ${globalRanking.length} links (${skipped} ignorados por <1000 impressões)`);
+            console.log(`[CRON-DB] Ranking global DB atualizado: ${validatedRanking.length} links (${skipped} ignorados por <1000 impressões)`);
         }
 
         // Log do top 5
-        const top = globalRanking.slice(0, 5);
+        const top = validatedRanking.slice(0, 5);
         for (let i = 0; i < top.length; i++) {
             console.log(`[CRON-DB] #${i + 1} ${top[i].domain} p=${top[i].postId} (eCPM: ${top[i].ecpm.toFixed(4)})`);
         }
 
-        return globalRanking;
+        return validatedRanking;
+    }
+
+    /**
+     * Busca os IDs de posts válidos de um domínio via API WordPress
+     * GET https://{domain}/wp-json/wp/v2/posts?per_page=100&_fields=id,title,link,date&orderby=date&order=desc
+     * Pagina automaticamente para buscar todos os posts
+     */
+    private async fetchValidPostIds(domain: string): Promise<Set<string>> {
+        const validIds = new Set<string>();
+        let page = 1;
+        const perPage = 100;
+
+        try {
+            while (true) {
+                const url = `https://${domain}/wp-json/wp/v2/posts?per_page=${perPage}&_fields=id,title,link,date&orderby=date&order=desc&page=${page}`;
+                const response = await fetch(url, {
+                    signal: AbortSignal.timeout(10000), // 10s timeout por request
+                    headers: { 'User-Agent': 'RedirectBot/1.0' }
+                });
+
+                if (!response.ok) {
+                    console.log(`[WP-VALIDATE] ${domain} page=${page} HTTP ${response.status} - parando`);
+                    break;
+                }
+
+                const posts = await response.json() as Array<{ id: number }>;
+
+                if (!Array.isArray(posts) || posts.length === 0) break;
+
+                for (const post of posts) {
+                    validIds.add(String(post.id));
+                }
+
+                // Se retornou menos que per_page, não tem mais páginas
+                if (posts.length < perPage) break;
+
+                page++;
+            }
+
+            console.log(`[WP-VALIDATE] ${domain}: ${validIds.size} posts válidos encontrados (${page} páginas)`);
+        } catch (error) {
+            console.error(`[WP-VALIDATE] Erro ao buscar posts de ${domain}:`, error instanceof Error ? error.message : error);
+        }
+
+        return validIds;
+    }
+
+    /**
+     * Busca posts válidos de todos os domínios presentes no ranking
+     * Retorna Map<domain, Set<postId>>
+     */
+    private async fetchAllValidPosts(domainsToCheck: string[]): Promise<Map<string, Set<string>>> {
+        const now = Date.now();
+
+        // Usar cache se ainda válido
+        if (this.validPostsCache.size > 0 && (now - this.validPostsCacheTime) < this.VALID_POSTS_CACHE_TTL_MS) {
+            // Verificar se todos os domínios solicitados estão no cache
+            const allCached = domainsToCheck.every(d => this.validPostsCache.has(d));
+            if (allCached) {
+                console.log(`[WP-VALIDATE] Usando cache em memória (${this.validPostsCache.size} domínios)`);
+                return this.validPostsCache;
+            }
+        }
+
+        const result = new Map<string, Set<string>>();
+
+        // Buscar todos os domínios em paralelo
+        const promises = domainsToCheck.map(async (domain) => {
+            const ids = await this.fetchValidPostIds(domain);
+            return { domain, ids };
+        });
+
+        const results = await Promise.allSettled(promises);
+
+        for (const r of results) {
+            if (r.status === 'fulfilled') {
+                result.set(r.value.domain, r.value.ids);
+            }
+        }
+
+        // Atualizar cache
+        this.validPostsCache = result;
+        this.validPostsCacheTime = now;
+
+        return result;
+    }
+
+    /**
+     * Filtra o ranking removendo posts que não existem no WordPress
+     */
+    private async validateRanking(ranking: RankedLinksList): Promise<RankedLinksList> {
+        // Coletar domínios únicos do ranking
+        const uniqueDomains = [...new Set(ranking.map(link => link.domain))];
+
+        if (uniqueDomains.length === 0) return ranking;
+
+        const validPostsMap = await this.fetchAllValidPosts(uniqueDomains);
+
+        let invalidCount = 0;
+        const validated = ranking.filter(link => {
+            const validIds = validPostsMap.get(link.domain);
+            // Se não conseguiu buscar os posts do domínio, mantém no ranking (não penalizar por falha de API)
+            if (!validIds || validIds.size === 0) return true;
+
+            const isValid = validIds.has(link.postId);
+            if (!isValid) invalidCount++;
+            return isValid;
+        });
+
+        if (invalidCount > 0) {
+            console.log(`[WP-VALIDATE] ${invalidCount} links removidos por post inexistente (${ranking.length} -> ${validated.length})`);
+        }
+
+        return validated;
     }
 
     /**
