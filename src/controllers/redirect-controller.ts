@@ -38,6 +38,15 @@ interface RedirectRule {
 }
 
 /**
+ * Resultado da busca de post IDs válidos de um domínio.
+ * Diferencia "API retornou dados" de "API falhou".
+ */
+interface FetchPostIdsResult {
+    success: boolean;
+    ids: Set<string>;
+}
+
+/**
  * Interface para regras de redirecionamento fora do in-app browser
  * Se o usuario NAO esta no in-app (Facebook/Instagram) e a utm_campaign bate, redireciona
  */
@@ -87,8 +96,8 @@ export class RedirectController {
     private inAppRulesCache: InAppRule[] | null = null;
     private inAppRulesCacheTime: number = 0;
 
-    // Cache em memória para posts válidos por domínio { domain: Set<postId> }
-    private validPostsCache: Map<string, Set<string>> = new Map();
+    // Cache em memória para posts válidos por domínio { domain: FetchPostIdsResult }
+    private validPostsCache: Map<string, FetchPostIdsResult> = new Map();
     private validPostsCacheTime: number = 0;
     private readonly VALID_POSTS_CACHE_TTL_MS = 900000; // 15 minutos
 
@@ -300,60 +309,80 @@ export class RedirectController {
     }
 
     /**
-     * Busca os IDs de posts válidos de um domínio via API WordPress
-     * GET https://{domain}/wp-json/wp/v2/posts?per_page=100&_fields=id,title,link,date&orderby=date&order=desc
-     * Pagina automaticamente para buscar todos os posts
+     * Busca IDs paginados de um endpoint WP REST API (posts ou pages).
+     * Retorna true se conseguiu buscar pelo menos uma página com sucesso.
      */
-    private async fetchValidPostIds(domain: string): Promise<Set<string>> {
-        const validIds = new Set<string>();
+    private async fetchIdsFromEndpoint(domain: string, endpoint: string, validIds: Set<string>): Promise<boolean> {
         let page = 1;
         const perPage = 100;
+        let atLeastOneSuccess = false;
 
-        try {
-            while (true) {
-                const url = `https://${domain}/wp-json/wp/v2/posts?per_page=${perPage}&_fields=id,title,link,date&orderby=date&order=desc&page=${page}`;
-                const response = await fetch(url, {
-                    signal: AbortSignal.timeout(10000), // 10s timeout por request
-                    headers: { 'User-Agent': 'RedirectBot/1.0' }
-                });
+        while (true) {
+            const url = `https://${domain}/wp-json/wp/v2/${endpoint}?per_page=${perPage}&_fields=id&orderby=date&order=desc&page=${page}`;
+            const response = await fetch(url, {
+                signal: AbortSignal.timeout(10000),
+                headers: { 'User-Agent': 'RedirectBot/1.0' }
+            });
 
-                if (!response.ok) {
-                    console.log(`[WP-VALIDATE] ${domain} page=${page} HTTP ${response.status} - parando`);
-                    break;
-                }
-
-                const posts = await response.json() as Array<{ id: number }>;
-
-                if (!Array.isArray(posts) || posts.length === 0) break;
-
-                for (const post of posts) {
-                    validIds.add(String(post.id));
-                }
-
-                // Se retornou menos que per_page, não tem mais páginas
-                if (posts.length < perPage) break;
-
-                page++;
+            if (!response.ok) {
+                console.log(`[WP-VALIDATE] ${domain} ${endpoint} page=${page} HTTP ${response.status} - parando`);
+                break;
             }
 
-            console.log(`[WP-VALIDATE] ${domain}: ${validIds.size} posts válidos encontrados (${page} páginas)`);
-        } catch (error) {
-            console.error(`[WP-VALIDATE] Erro ao buscar posts de ${domain}:`, error instanceof Error ? error.message : error);
+            atLeastOneSuccess = true;
+            const items = await response.json() as Array<{ id: number }>;
+
+            if (!Array.isArray(items) || items.length === 0) break;
+
+            for (const item of items) {
+                validIds.add(String(item.id));
+            }
+
+            if (items.length < perPage) break;
+            page++;
         }
 
-        return validIds;
+        return atLeastOneSuccess;
     }
 
     /**
-     * Busca posts válidos de todos os domínios presentes no ranking
-     * Retorna Map<domain, Set<postId>>
+     * Busca os IDs de posts e pages válidos de um domínio via API WordPress.
+     * Retorna { success: true, ids } se pelo menos um endpoint respondeu,
+     * ou { success: false, ids: empty } se ambos falharam.
      */
-    private async fetchAllValidPosts(domainsToCheck: string[]): Promise<Map<string, Set<string>>> {
+    private async fetchValidPostIds(domain: string): Promise<FetchPostIdsResult> {
+        const validIds = new Set<string>();
+
+        try {
+            // Buscar posts e pages em paralelo
+            const [postsOk, pagesOk] = await Promise.all([
+                this.fetchIdsFromEndpoint(domain, 'posts', validIds).catch(() => false),
+                this.fetchIdsFromEndpoint(domain, 'pages', validIds).catch(() => false),
+            ]);
+
+            if (!postsOk && !pagesOk) {
+                console.error(`[WP-VALIDATE] ${domain}: ambos endpoints (posts + pages) falharam`);
+                return { success: false, ids: validIds };
+            }
+
+            console.log(`[WP-VALIDATE] ${domain}: ${validIds.size} IDs válidos encontrados (posts: ${postsOk ? 'ok' : 'falhou'}, pages: ${pagesOk ? 'ok' : 'falhou'})`);
+            return { success: true, ids: validIds };
+        } catch (error) {
+            console.error(`[WP-VALIDATE] Erro ao buscar posts/pages de ${domain}:`, error instanceof Error ? error.message : error);
+            return { success: false, ids: validIds };
+        }
+    }
+
+    /**
+     * Busca posts válidos de todos os domínios presentes no ranking.
+     * Retorna Map<domain, FetchPostIdsResult> para que o caller saiba se a API falhou ou não.
+     * Se a API falhou para um domínio, tenta usar o cache anterior como fallback.
+     */
+    private async fetchAllValidPosts(domainsToCheck: string[]): Promise<Map<string, FetchPostIdsResult>> {
         const now = Date.now();
 
         // Usar cache se ainda válido
         if (this.validPostsCache.size > 0 && (now - this.validPostsCacheTime) < this.VALID_POSTS_CACHE_TTL_MS) {
-            // Verificar se todos os domínios solicitados estão no cache
             const allCached = domainsToCheck.every(d => this.validPostsCache.has(d));
             if (allCached) {
                 console.log(`[WP-VALIDATE] Usando cache em memória (${this.validPostsCache.size} domínios)`);
@@ -361,23 +390,41 @@ export class RedirectController {
             }
         }
 
-        const result = new Map<string, Set<string>>();
+        // Guardar referência ao cache anterior para fallback
+        const previousCache = this.validPostsCache;
+
+        const result = new Map<string, FetchPostIdsResult>();
 
         // Buscar todos os domínios em paralelo
         const promises = domainsToCheck.map(async (domain) => {
-            const ids = await this.fetchValidPostIds(domain);
-            return { domain, ids };
+            const fetchResult = await this.fetchValidPostIds(domain);
+            return { domain, fetchResult };
         });
 
         const results = await Promise.allSettled(promises);
 
         for (const r of results) {
             if (r.status === 'fulfilled') {
-                result.set(r.value.domain, r.value.ids);
+                const { domain, fetchResult } = r.value;
+
+                if (!fetchResult.success) {
+                    // API falhou — tentar usar cache anterior como fallback
+                    const cached = previousCache.get(domain);
+                    if (cached && cached.success && cached.ids.size > 0) {
+                        console.log(`[WP-VALIDATE] ${domain}: API falhou, usando cache anterior (${cached.ids.size} IDs)`);
+                        result.set(domain, cached);
+                    } else {
+                        // Sem cache anterior — marcar como falha (links serão removidos)
+                        console.warn(`[WP-VALIDATE] ${domain}: API falhou e sem cache anterior — links serão removidos`);
+                        result.set(domain, fetchResult);
+                    }
+                } else {
+                    result.set(domain, fetchResult);
+                }
             }
         }
 
-        // Atualizar cache
+        // Atualizar cache apenas com resultados bem-sucedidos
         this.validPostsCache = result;
         this.validPostsCacheTime = now;
 
@@ -385,10 +432,12 @@ export class RedirectController {
     }
 
     /**
-     * Filtra o ranking removendo posts que não existem no WordPress
+     * Filtra o ranking removendo posts que não existem no WordPress.
+     * - Se a API respondeu com sucesso: filtra posts inexistentes.
+     * - Se a API falhou E não tem cache anterior: remove todos os links do domínio.
+     * - Se a API retornou 0 posts com sucesso: remove todos os links do domínio (domínio vazio).
      */
     private async validateRanking(ranking: RankedLinksList): Promise<RankedLinksList> {
-        // Coletar domínios únicos do ranking
         const uniqueDomains = [...new Set(ranking.map(link => link.domain))];
 
         if (uniqueDomains.length === 0) return ranking;
@@ -396,18 +445,36 @@ export class RedirectController {
         const validPostsMap = await this.fetchAllValidPosts(uniqueDomains);
 
         let invalidCount = 0;
+        let removedByFailure = 0;
         const validated = ranking.filter(link => {
-            const validIds = validPostsMap.get(link.domain);
-            // Se não conseguiu buscar os posts do domínio, mantém no ranking (não penalizar por falha de API)
-            if (!validIds || validIds.size === 0) return true;
+            const result = validPostsMap.get(link.domain);
 
-            const isValid = validIds.has(link.postId);
+            // Domínio não presente no mapa (Promise rejeitada) — remover link
+            if (!result) {
+                removedByFailure++;
+                return false;
+            }
+
+            // API falhou e sem cache anterior — remover link
+            if (!result.success) {
+                removedByFailure++;
+                return false;
+            }
+
+            // API respondeu com sucesso mas 0 IDs — domínio sem conteúdo, remover
+            if (result.ids.size === 0) {
+                invalidCount++;
+                return false;
+            }
+
+            // Validar se o post ID existe
+            const isValid = result.ids.has(link.postId);
             if (!isValid) invalidCount++;
             return isValid;
         });
 
-        if (invalidCount > 0) {
-            console.log(`[WP-VALIDATE] ${invalidCount} links removidos por post inexistente (${ranking.length} -> ${validated.length})`);
+        if (invalidCount > 0 || removedByFailure > 0) {
+            console.log(`[WP-VALIDATE] ${invalidCount} links removidos por post inexistente, ${removedByFailure} removidos por falha de API (${ranking.length} -> ${validated.length})`);
         }
 
         return validated;
