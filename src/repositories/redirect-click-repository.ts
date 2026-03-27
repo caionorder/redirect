@@ -226,4 +226,79 @@ export class RedirectClickRepository {
 
         return incrementedCount;
     }
+
+    /**
+     * Busca click counts agrupados por sufixo domain_postId.
+     * Os link_ids seguem o padrão: rank{N}[_db]_{domain}_{postId} ou random[_db]_{domain} etc.
+     * Este método recebe uma lista de sufixos (ex: "example.com_123") e retorna a soma de clicks
+     * de todos os link_ids que terminam com cada sufixo.
+     */
+    async getClickCountsBySuffixes(suffixes: string[]): Promise<Map<string, number>> {
+        if (suffixes.length === 0) return new Map();
+
+        // Construir regex patterns para $or query
+        const orConditions = suffixes.map(suffix => ({
+            link_id: { $regex: `_${suffix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$` }
+        }));
+
+        const results = await this.collection.aggregate<{ _id: string; totalClicks: number }>([
+            { $match: { $or: orConditions } },
+            {
+                $addFields: {
+                    // Extrair sufixo: tudo após o primeiro underscore seguido de domínio
+                    // Como link_id = rank0_domain_postId ou rank0_db_domain_postId
+                    suffix: {
+                        $let: {
+                            vars: {
+                                parts: { $split: ['$link_id', '_'] }
+                            },
+                            in: {
+                                $cond: {
+                                    if: { $eq: [{ $arrayElemAt: ['$$parts', 1] }, 'db'] },
+                                    then: {
+                                        $reduce: {
+                                            input: { $slice: ['$$parts', 2, { $subtract: [{ $size: '$$parts' }, 2] }] },
+                                            initialValue: '',
+                                            in: {
+                                                $cond: {
+                                                    if: { $eq: ['$$value', ''] },
+                                                    then: '$$this',
+                                                    else: { $concat: ['$$value', '_', '$$this'] }
+                                                }
+                                            }
+                                        }
+                                    },
+                                    else: {
+                                        $reduce: {
+                                            input: { $slice: ['$$parts', 1, { $subtract: [{ $size: '$$parts' }, 1] }] },
+                                            initialValue: '',
+                                            in: {
+                                                $cond: {
+                                                    if: { $eq: ['$$value', ''] },
+                                                    then: '$$this',
+                                                    else: { $concat: ['$$value', '_', '$$this'] }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            {
+                $group: {
+                    _id: '$suffix',
+                    totalClicks: { $sum: '$count' }
+                }
+            }
+        ]).toArray();
+
+        const map = new Map<string, number>();
+        for (const r of results) {
+            map.set(r._id, r.totalClicks);
+        }
+        return map;
+    }
 }

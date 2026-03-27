@@ -1159,6 +1159,94 @@ export class RedirectController {
         }
     }
 
+    public async getRank(req: Request, res: Response): Promise<void> {
+        try {
+            if (!this.redirectClickRepository) {
+                res.status(503).json({ error: 'Database not connected' });
+                return;
+            }
+
+            // Parâmetro de ordenação: ecpm (default) ou clicks
+            const sortBy = (req.query.sort as string) || 'clicks';
+            // Parâmetro de source: all (default), main, db
+            const source = (req.query.source as string) || 'all';
+            // Limite de resultados
+            const limit = parseInt(req.query.limit as string) || 100;
+
+            // Buscar rankings do cache (memória/Redis)
+            const [mainRanking, dbRanking] = await Promise.all([
+                (source === 'all' || source === 'main') ? this.getBestLinksMap() : null,
+                (source === 'all' || source === 'db') ? this.getBestLinksMapDb() : null
+            ]);
+
+            // Combinar rankings, marcando a origem
+            const combinedRanking: Array<LinkInfo & { source: string }> = [];
+
+            if (mainRanking) {
+                for (const item of mainRanking) {
+                    combinedRanking.push({ ...item, source: 'main' });
+                }
+            }
+            if (dbRanking) {
+                for (const item of dbRanking) {
+                    combinedRanking.push({ ...item, source: 'db' });
+                }
+            }
+
+            if (combinedRanking.length === 0) {
+                res.status(200).json({ rank: [], total: 0 });
+                return;
+            }
+
+            // Construir sufixos únicos para busca bulk: domain_postId
+            const suffixSet = new Set<string>();
+            for (const item of combinedRanking) {
+                suffixSet.add(`${item.domain}_${item.postId}`);
+            }
+            const suffixes = Array.from(suffixSet);
+
+            // Busca bulk de click counts (uma única aggregation no MongoDB)
+            const clickCountsMap = await this.redirectClickRepository.getClickCountsBySuffixes(suffixes);
+
+            // Montar resultado combinado
+            const result = combinedRanking.map(item => {
+                const suffix = `${item.domain}_${item.postId}`;
+                return {
+                    url: item.url,
+                    domain: item.domain,
+                    postId: item.postId,
+                    ecpm: item.ecpm,
+                    clickCount: clickCountsMap.get(suffix) || 0,
+                    source: item.source
+                };
+            });
+
+            // Ordenar conforme parâmetro
+            if (sortBy === 'ecpm') {
+                result.sort((a, b) => b.ecpm - a.ecpm);
+            } else {
+                // Default: ordenar por clickCount desc
+                result.sort((a, b) => b.clickCount - a.clickCount);
+            }
+
+            // Aplicar limite
+            const limited = result.slice(0, limit);
+
+            res.status(200).json({
+                rank: limited,
+                total: result.length,
+                sort: sortBy,
+                source
+            });
+        } catch (error) {
+            console.error('Error getting rank:', error);
+            res.status(500).json({
+                error: 'Internal server error',
+                message: 'Failed to get rank'
+            });
+        }
+    }
+
     public async getStats(req: Request, res: Response): Promise<void> {
         try {
             if (!this.gamAdUnitRepository || !this.redirectClickRepository) {
