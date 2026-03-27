@@ -181,7 +181,7 @@ export class RedirectController {
             if (!item.domain || !item.custom_value) continue;
 
             const impressions = Number(item.impressions || 0);
-            if (impressions < 1000) {
+            if (impressions < 100) {
                 skipped++;
                 continue;
             }
@@ -265,7 +265,7 @@ export class RedirectController {
             if (!item.domain || !item.custom_value) continue;
 
             const impressions = Number(item.impressions || 0);
-            if (impressions < 1000) {
+            if (impressions < 100) {
                 skipped++;
                 continue;
             }
