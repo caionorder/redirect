@@ -6,6 +6,7 @@ import { SuperFilterService } from '../services/superfilter-service';
 import { GamAdUnitRepository } from '../repositories/gam-ad-unit-repository';
 import { RedirectLinkRepository } from '../repositories/redirect-link-repository';
 import { RedirectClickRepository } from '../repositories/redirect-click-repository';
+import { BroadClickRepository } from '../repositories/broad-click-repository';
 import { IFilterRequest } from '../interfaces/filter-interfaces';
 import { redis } from '../config/redis';
 import { generateRandomPath, domains, domains_db } from '../config/domains';
@@ -64,6 +65,7 @@ export class RedirectController {
     private gamAdUnitRepository?: GamAdUnitRepository;
     private redirectLinkRepository?: RedirectLinkRepository;
     private redirectClickRepository?: RedirectClickRepository;
+    private broadClickRepository?: BroadClickRepository;
     private redisClient: typeof redis | null;
 
     // Chaves Redis
@@ -109,6 +111,7 @@ export class RedirectController {
             this.gamAdUnitRepository = new GamAdUnitRepository(db);
             this.redirectLinkRepository = new RedirectLinkRepository(db);
             this.redirectClickRepository = new RedirectClickRepository(db);
+            this.broadClickRepository = new BroadClickRepository(db);
         }
 
         const isMainProcess = !cluster.isWorker || cluster.worker?.id === 1;
@@ -995,23 +998,33 @@ export class RedirectController {
             const visitInfo = ` (visita #${visitIndex + 1})`;
             console.log(`[${logType}]${langInfo} ${domain}${visitInfo} -> ${redirectUrl}`);
 
-            // UTM params
-            const utmParams = new URLSearchParams();
-            utmParams.append('utm_source', (req.query.utm_source as string) || 'redron');
-            utmParams.append('utm_medium', (req.query.utm_medium as string) || 'broadcast');
-            utmParams.append('utm_campaign', (req.query.utm_campaign as string) || linkId || 'direct');
-            if (req.query.utm_term) utmParams.append('utm_term', req.query.utm_term as string);
-            if (req.query.utm_content) utmParams.append('utm_content', req.query.utm_content as string);
-            if (req.query.fbclid) utmParams.append('fbclid', req.query.fbclid as string);
-            if (req.query.gclid) utmParams.append('gclid', req.query.gclid as string);
+            // Repassa TODOS os query params recebidos, com defaults para UTMs
+            const allParams = new URLSearchParams();
+            for (const [key, value] of Object.entries(req.query)) {
+                if (value !== undefined && value !== null) {
+                    allParams.set(key, String(value));
+                }
+            }
+            // Defaults para UTMs caso nao tenham vindo na URL
+            if (!allParams.has('utm_source')) allParams.set('utm_source', 'redron');
+            if (!allParams.has('utm_medium')) allParams.set('utm_medium', 'broadcast');
+            if (!allParams.has('utm_campaign')) allParams.set('utm_campaign', linkId || 'direct');
 
             const separator = redirectUrl.includes('?') ? '&' : '?';
-            const finalRedirectUrl = `${redirectUrl}${separator}${utmParams.toString()}`;
+            const finalRedirectUrl = `${redirectUrl}${separator}${allParams.toString()}`;
 
             // Registrar click
             if (linkId && this.redirectClickRepository) {
                 this.redirectClickRepository.incrementClick(linkId)
                     .then(result => console.log(`[CLICK RECORDED] LinkID: ${linkId}, New Count: ${result.count}`))
+                    .catch(() => {});
+            }
+
+            // Registrar click por broad (contador separado por data)
+            const broad = req.query.broad as string;
+            if (broad && this.broadClickRepository) {
+                this.broadClickRepository.incrementClick(broad)
+                    .then(result => console.log(`[CLICK RECORDED BROAD] ${broad}, New Count: ${result.count}`))
                     .catch(() => {});
             }
 
@@ -1125,23 +1138,33 @@ export class RedirectController {
             const visitInfo = ` (visita #${visitIndex + 1})`;
             console.log(`[${logType}] ${domain}${visitInfo} -> ${redirectUrl}`);
 
-            // UTM params
-            const utmParams = new URLSearchParams();
-            utmParams.append('utm_source', (req.query.utm_source as string) || 'redron');
-            utmParams.append('utm_medium', (req.query.utm_medium as string) || 'broadcast');
-            utmParams.append('utm_campaign', (req.query.utm_campaign as string) || linkId || 'direct');
-            if (req.query.utm_term) utmParams.append('utm_term', req.query.utm_term as string);
-            if (req.query.utm_content) utmParams.append('utm_content', req.query.utm_content as string);
-            if (req.query.fbclid) utmParams.append('fbclid', req.query.fbclid as string);
-            if (req.query.gclid) utmParams.append('gclid', req.query.gclid as string);
+            // Repassa TODOS os query params recebidos, com defaults para UTMs
+            const allParams = new URLSearchParams();
+            for (const [key, value] of Object.entries(req.query)) {
+                if (value !== undefined && value !== null) {
+                    allParams.set(key, String(value));
+                }
+            }
+            // Defaults para UTMs caso nao tenham vindo na URL
+            if (!allParams.has('utm_source')) allParams.set('utm_source', 'redron');
+            if (!allParams.has('utm_medium')) allParams.set('utm_medium', 'broadcast');
+            if (!allParams.has('utm_campaign')) allParams.set('utm_campaign', linkId || 'direct');
 
             const separator = redirectUrl.includes('?') ? '&' : '?';
-            const finalRedirectUrl = `${redirectUrl}${separator}${utmParams.toString()}`;
+            const finalRedirectUrl = `${redirectUrl}${separator}${allParams.toString()}`;
 
             // Registrar click
             if (linkId && this.redirectClickRepository) {
                 this.redirectClickRepository.incrementClick(linkId)
                     .then(result => console.log(`[CLICK RECORDED DB] LinkID: ${linkId}, New Count: ${result.count}`))
+                    .catch(() => {});
+            }
+
+            // Registrar click por broad (contador separado por data)
+            const broad = req.query.broad as string;
+            if (broad && this.broadClickRepository) {
+                this.broadClickRepository.incrementClick(broad)
+                    .then(result => console.log(`[CLICK RECORDED BROAD DB] ${broad}, New Count: ${result.count}`))
                     .catch(() => {});
             }
 
@@ -1244,6 +1267,24 @@ export class RedirectController {
                 error: 'Internal server error',
                 message: 'Failed to get rank'
             });
+        }
+    }
+
+    public async getBroadClicks(req: Request, res: Response): Promise<void> {
+        try {
+            if (!this.broadClickRepository) {
+                res.status(500).json({ error: 'Database not available' });
+                return;
+            }
+
+            const start = req.query.start as string | undefined;
+            const end = req.query.end as string | undefined;
+
+            const clicks = await this.broadClickRepository.getClicks(start, end);
+            res.json(clicks);
+        } catch (error) {
+            console.error('[ERROR] getBroadClicks:', error);
+            res.status(500).json({ error: 'Internal server error' });
         }
     }
 

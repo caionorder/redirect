@@ -36,6 +36,11 @@ export function createRedirectRouter(db?: Db): Router {
     controller.getRedirectLinks(req, res)
   );
 
+  // Rota para clicks por broad
+  router.get('/broad-clicks', (req, res) =>
+    controller.getBroadClicks(req, res)
+  );
+
   // Rotas para regras de redirecionamento condicional
   router.get('/rules', (req, res) =>
     controller.listRules(req, res)
