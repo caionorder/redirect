@@ -26,6 +26,11 @@ export function createRedirectRouter(db?: Db): Router {
     controller.getRank(req, res)
   );
 
+  // Rota para ver ranking agrupado por domínio
+  router.get('/rank-by-domain', (req, res) =>
+    controller.getRankByDomain(req, res)
+  );
+
   // Rota para valores distintos
   router.get('/distinct/:field', (req, res) =>
     controller.getDistinctValues(req, res)
