@@ -8,8 +8,25 @@ export const domains = [
     "informanoticia.com",
     "buscaapp.com.br",
     "lavoriinitalia.com",
-    "cincosete.com"
+    "promo.dopeaaps.com",
+    "promo.appmobile4u.com",
+    "cincosete.com",
+    "finance.dopeaaps.com",
+    "finance.appmobile4u.com",
+
 ];
+
+export const domains_db = [
+    // "appmynews.com",
+    // "hoteltyp.com",
+    // "ghcconnect.com",
+    "forexmania.club",
+    "netseguro.tech",
+    "techerdowns.com",
+    "creditoclube.com.br",
+    "dicasdocartao.com.br"
+];
+
 
 export interface IFallbackDomain {
     url: string;

@@ -11,12 +11,27 @@ import { createRedirectRouter } from './routes/redirect-route';
 import { RedirectController } from './controllers/redirect-controller';
 import { errorHandler } from './middleware/error-handler';
 import { Db } from 'mongodb';
+import { domains, domains_db } from './config/domains';
 
 export async function createApp(): Promise<Express> {
     const app = express();
 
+    // Gerar frame-src dinamicamente a partir dos domínios configurados
+    const allDomains = [...domains, ...domains_db];
+    const frameSrcDomains = allDomains.flatMap(d => [`https://${d}`, `https://*.${d}`]);
+
     // Configurações de segurança
-    app.use(helmet());
+    app.use(helmet({
+        contentSecurityPolicy: {
+            directives: {
+                defaultSrc: ["'self'"],
+                frameSrc: ["'self'", ...frameSrcDomains],
+                frameAncestors: ["'self'"],
+                scriptSrc: ["'self'", "'unsafe-inline'"],
+                styleSrc: ["'self'", "'unsafe-inline'"],
+            }
+        }
+    }));
     app.set('trust proxy', 1);
     app.disable('x-powered-by');
     app.set('etag', false);
@@ -82,8 +97,15 @@ export async function createApp(): Promise<Express> {
         // IMPORTANTE: Rota raiz "/" executa o redirect diretamente
         app.get('/', (req, res) => redirectController.redirect(req, res));
 
-        // Montar as rotas em /api
+        // Rota "/db" executa o redirect usando domains_db
+        app.get('/db', (req, res) => redirectController.redirectDb(req, res));
+
+        // Montar as rotas em /api (antes das rotas com :campaignId para não conflitar)
         app.use('/api', createRedirectRouter(db));
+
+        // Rotas com campaignId no path (ex: /120242094780560734 ou /db/120242094780560734)
+        app.get('/db/:campaignId', (req, res) => redirectController.redirectDb(req, res));
+        app.get('/:campaignId', (req, res) => redirectController.redirect(req, res));
     } else {
         // Rota de fallback se não houver DB
         app.use('/api', (_req, res) => {
