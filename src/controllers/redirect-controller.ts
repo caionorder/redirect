@@ -514,20 +514,28 @@ export class RedirectController {
     }
 
     /**
-     * Retorna quantas vezes o visitante ja acessou nesta hora (antes de incrementar)
-     * e incrementa o contador. TTL 1 hora.
+     * Retorna a lista de domínios já visitados pelo IP nesta hora.
      */
-    private async getVisitorVisitCount(ip: string, type: 'main' | 'db'): Promise<number> {
-        if (!this.redisClient) return 0;
-
+    private async getVisitedDomains(ip: string, type: 'main' | 'db'): Promise<string[]> {
+        if (!this.redisClient) return [];
         const key = this.getVisitorKey(ip, type);
-        const count = await this.redisClient.incr(key);
-        // Setar TTL apenas na primeira visita (count === 1)
-        if (count === 1) {
-            await this.redisClient.expire(key, 3600);
+        return await this.redisClient.smembers(key);
+    }
+
+    /**
+     * Adiciona um domínio à lista de visitados e define TTL de 1h na primeira inserção.
+     */
+    private async addVisitedDomain(ip: string, type: 'main' | 'db', domain: string): Promise<void> {
+        if (!this.redisClient) return;
+        const key = this.getVisitorKey(ip, type);
+        const added = await this.redisClient.sadd(key, domain);
+        // Se foi o primeiro elemento adicionado, setar TTL
+        if (added === 1) {
+            const ttl = await this.redisClient.ttl(key);
+            if (ttl === -1) {
+                await this.redisClient.expire(key, 3600);
+            }
         }
-        // count=1 significa primeira visita (index 0), count=2 segunda (index 1), etc.
-        return count - 1;
     }
 
     /**
@@ -925,8 +933,9 @@ export class RedirectController {
             // Verificar idioma
             const language = req.query.language as string;
 
-            // Contar visitas do visitante nesta hora (ranking global, sem dominio)
-            const visitIndex = await this.getVisitorVisitCount(clientIp, 'main');
+            // Buscar domínios já visitados pelo IP nesta hora
+            const visitedDomains = await this.getVisitedDomains(clientIp, 'main');
+            const visitIndex = visitedDomains.length;
 
             // Buscar ranking global de links
             const globalRanking = await this.getBestLinksMap();
@@ -937,15 +946,20 @@ export class RedirectController {
             let domain: string;
 
             if (globalRanking && globalRanking.length > 0) {
-                if (visitIndex < globalRanking.length) {
-                    // Visita N -> pega o N-esimo melhor eCPM global
-                    const linkInfo = globalRanking[visitIndex];
+                // Encontrar o primeiro link cujo domínio ainda não foi visitado
+                const visitedSet = new Set(visitedDomains);
+                const foundIndex = globalRanking.findIndex(link => !visitedSet.has(link.domain));
+
+                if (foundIndex !== -1) {
+                    const linkInfo = globalRanking[foundIndex];
                     redirectUrl = linkInfo.url;
                     domain = linkInfo.domain;
-                    linkId = `rank${visitIndex}_${domain}_${linkInfo.postId}`;
-                    logType = `RANK #${visitIndex + 1}`;
+                    linkId = `rank${foundIndex}_${domain}_${linkInfo.postId}`;
+                    logType = `RANK #${foundIndex + 1}`;
+                    // Registrar domínio como visitado
+                    await this.addVisitedDomain(clientIp, 'main', domain);
                 } else {
-                    // Esgotou todos os links do ranking -> dominio aleatorio + /random
+                    // Todos os domínios do ranking já foram visitados -> domínio aleatório + /random
                     domain = domains[Math.floor(Math.random() * domains.length)];
                     redirectUrl = `https://${domain}${generateRandomPath()}`;
                     linkId = `random_${domain}`;
@@ -995,7 +1009,7 @@ export class RedirectController {
 
             // Log com informacao de idioma e dominio
             const langInfo = isNoLangDomain ? ' [BRUTO]' : (language ? ` [${language.toUpperCase()}]` : (isInvertedDomain ? ' [EN]' : ''));
-            const visitInfo = ` (visita #${visitIndex + 1})`;
+            const visitInfo = ` (visita #${visitedDomains.length + 1})`;
             console.log(`[${logType}]${langInfo} ${domain}${visitInfo} -> ${redirectUrl}`);
 
             // Repassa TODOS os query params recebidos, com defaults para UTMs
@@ -1008,7 +1022,12 @@ export class RedirectController {
             // Defaults para UTMs caso nao tenham vindo na URL
             if (!allParams.has('utm_source')) allParams.set('utm_source', 'redron');
             if (!allParams.has('utm_medium')) allParams.set('utm_medium', 'broadcast');
-            if (!allParams.has('utm_campaign')) allParams.set('utm_campaign', linkId || 'direct');
+            const broadValue = req.query.broad as string;
+            if (broadValue) {
+                allParams.set('utm_campaign', broadValue);
+            } else if (!allParams.has('utm_campaign')) {
+                allParams.set('utm_campaign', linkId || 'direct');
+            }
 
             const separator = redirectUrl.includes('?') ? '&' : '?';
             const finalRedirectUrl = `${redirectUrl}${separator}${allParams.toString()}`;
@@ -1097,8 +1116,9 @@ export class RedirectController {
             const clientIp = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ||
                            req.socket.remoteAddress || 'unknown';
 
-            // Contar visitas do visitante nesta hora (ranking global DB, sem dominio)
-            const visitIndex = await this.getVisitorVisitCount(clientIp, 'db');
+            // Buscar domínios já visitados pelo IP nesta hora
+            const visitedDomains = await this.getVisitedDomains(clientIp, 'db');
+            const visitIndex = visitedDomains.length;
 
             // Buscar ranking global de links DB
             const globalRanking = await this.getBestLinksMapDb();
@@ -1109,15 +1129,20 @@ export class RedirectController {
             let domain: string;
 
             if (globalRanking && globalRanking.length > 0) {
-                if (visitIndex < globalRanking.length) {
-                    // Visita N -> pega o N-esimo melhor eCPM global
-                    const linkInfo = globalRanking[visitIndex];
+                // Encontrar o primeiro link cujo domínio ainda não foi visitado
+                const visitedSet = new Set(visitedDomains);
+                const foundIndex = globalRanking.findIndex(link => !visitedSet.has(link.domain));
+
+                if (foundIndex !== -1) {
+                    const linkInfo = globalRanking[foundIndex];
                     redirectUrl = linkInfo.url;
                     domain = linkInfo.domain;
-                    linkId = `rank${visitIndex}_db_${domain}_${linkInfo.postId}`;
-                    logType = `RANK #${visitIndex + 1} DB`;
+                    linkId = `rank${foundIndex}_db_${domain}_${linkInfo.postId}`;
+                    logType = `RANK #${foundIndex + 1} DB`;
+                    // Registrar domínio como visitado
+                    await this.addVisitedDomain(clientIp, 'db', domain);
                 } else {
-                    // Esgotou todos os links do ranking -> dominio aleatorio + /random
+                    // Todos os domínios do ranking já foram visitados -> domínio aleatório + /random
                     domain = domains_db[Math.floor(Math.random() * domains_db.length)];
                     redirectUrl = `https://${domain}${generateRandomPath()}`;
                     linkId = `random_db_${domain}`;
@@ -1135,7 +1160,7 @@ export class RedirectController {
             // domains_db não usa prefixo de idioma (/en/, /es/, etc)
 
             // Log
-            const visitInfo = ` (visita #${visitIndex + 1})`;
+            const visitInfo = ` (visita #${visitedDomains.length + 1})`;
             console.log(`[${logType}] ${domain}${visitInfo} -> ${redirectUrl}`);
 
             // Repassa TODOS os query params recebidos, com defaults para UTMs
@@ -1148,7 +1173,12 @@ export class RedirectController {
             // Defaults para UTMs caso nao tenham vindo na URL
             if (!allParams.has('utm_source')) allParams.set('utm_source', 'redron');
             if (!allParams.has('utm_medium')) allParams.set('utm_medium', 'broadcast');
-            if (!allParams.has('utm_campaign')) allParams.set('utm_campaign', linkId || 'direct');
+            const broadValue = req.query.broad as string;
+            if (broadValue) {
+                allParams.set('utm_campaign', broadValue);
+            } else if (!allParams.has('utm_campaign')) {
+                allParams.set('utm_campaign', linkId || 'direct');
+            }
 
             const separator = redirectUrl.includes('?') ? '&' : '?';
             const finalRedirectUrl = `${redirectUrl}${separator}${allParams.toString()}`;
