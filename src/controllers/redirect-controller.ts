@@ -207,24 +207,27 @@ export class RedirectController {
         // Validar posts via API WordPress (remover posts inexistentes)
         const validatedRanking = await this.validateRanking(globalRanking);
 
+        // Pegar apenas os top 20 melhores eCPM (já está ordenado desc)
+        const topRanking = validatedRanking.slice(0, 20);
+
         // Salvar no cache Redis (1 hora)
-        if (this.redisClient && validatedRanking.length > 0) {
+        if (this.redisClient && topRanking.length > 0) {
             await this.redisClient.set(
                 this.BEST_LINKS_MAP_KEY,
-                JSON.stringify(validatedRanking),
+                JSON.stringify(topRanking),
                 'EX',
                 3600
             );
-            console.log(`[CRON] Ranking global atualizado: ${validatedRanking.length} links (${skipped} ignorados por <1000 impressões)`);
+            console.log(`[CRON] Ranking global atualizado: ${topRanking.length} links no rank (${validatedRanking.length} validados, ${skipped} ignorados por <100 impressões)`);
         }
 
         // Log do top 5
-        const top = validatedRanking.slice(0, 5);
+        const top = topRanking.slice(0, 5);
         for (let i = 0; i < top.length; i++) {
             console.log(`[CRON] #${i + 1} ${top[i].domain} p=${top[i].postId} (eCPM: ${top[i].ecpm.toFixed(4)})`);
         }
 
-        return validatedRanking;
+        return topRanking;
     }
 
     /**
@@ -291,24 +294,27 @@ export class RedirectController {
         // Validar posts via API WordPress (remover posts inexistentes)
         const validatedRanking = await this.validateRanking(globalRanking);
 
+        // Pegar apenas os top 20 melhores eCPM (já está ordenado desc)
+        const topRanking = validatedRanking.slice(0, 20);
+
         // Salvar no cache Redis (1 hora)
-        if (this.redisClient && validatedRanking.length > 0) {
+        if (this.redisClient && topRanking.length > 0) {
             await this.redisClient.set(
                 this.BEST_LINKS_MAP_DB_KEY,
-                JSON.stringify(validatedRanking),
+                JSON.stringify(topRanking),
                 'EX',
                 3600
             );
-            console.log(`[CRON-DB] Ranking global DB atualizado: ${validatedRanking.length} links (${skipped} ignorados por <1000 impressões)`);
+            console.log(`[CRON-DB] Ranking global DB atualizado: ${topRanking.length} links no rank (${validatedRanking.length} validados, ${skipped} ignorados por <100 impressões)`);
         }
 
         // Log do top 5
-        const top = validatedRanking.slice(0, 5);
+        const top = topRanking.slice(0, 5);
         for (let i = 0; i < top.length; i++) {
             console.log(`[CRON-DB] #${i + 1} ${top[i].domain} p=${top[i].postId} (eCPM: ${top[i].ecpm.toFixed(4)})`);
         }
 
-        return validatedRanking;
+        return topRanking;
     }
 
     /**
@@ -937,20 +943,13 @@ export class RedirectController {
             let domain: string;
 
             if (globalRanking && globalRanking.length > 0) {
-                if (visitIndex < globalRanking.length) {
-                    // Visita N -> pega o N-esimo melhor eCPM global
-                    const linkInfo = globalRanking[visitIndex];
-                    redirectUrl = linkInfo.url;
-                    domain = linkInfo.domain;
-                    linkId = `rank${visitIndex}_${domain}_${linkInfo.postId}`;
-                    logType = `RANK #${visitIndex + 1}`;
-                } else {
-                    // Esgotou todos os links do ranking -> dominio aleatorio + /random
-                    domain = domains[Math.floor(Math.random() * domains.length)];
-                    redirectUrl = `https://${domain}${generateRandomPath()}`;
-                    linkId = `random_${domain}`;
-                    logType = 'RANDOM LINK';
-                }
+                // Esgotou o ranking -> volta pro primeiro (ciclo)
+                const idx = visitIndex % globalRanking.length;
+                const linkInfo = globalRanking[idx];
+                redirectUrl = linkInfo.url;
+                domain = linkInfo.domain;
+                linkId = `rank${idx}_${domain}_${linkInfo.postId}`;
+                logType = `RANK #${idx + 1}`;
             } else {
                 // Sem dados de ranking -> dominio aleatorio + /random
                 domain = domains[Math.floor(Math.random() * domains.length)];
@@ -1008,7 +1007,12 @@ export class RedirectController {
             // Defaults para UTMs caso nao tenham vindo na URL
             if (!allParams.has('utm_source')) allParams.set('utm_source', 'redron');
             if (!allParams.has('utm_medium')) allParams.set('utm_medium', 'broadcast');
-            if (!allParams.has('utm_campaign')) allParams.set('utm_campaign', linkId || 'direct');
+            const broad = req.query.broad as string;
+            if (broad) {
+                allParams.set('utm_campaign', broad);
+            } else if (!allParams.has('utm_campaign')) {
+                allParams.set('utm_campaign', linkId || 'direct');
+            }
 
             const separator = redirectUrl.includes('?') ? '&' : '?';
             const finalRedirectUrl = `${redirectUrl}${separator}${allParams.toString()}`;
@@ -1019,9 +1023,6 @@ export class RedirectController {
                     .then(result => console.log(`[CLICK RECORDED] LinkID: ${linkId}, New Count: ${result.count}`))
                     .catch(() => {});
             }
-
-            // Registrar click por broad (contador separado por data)
-            const broad = req.query.broad as string;
             if (broad && this.broadClickRepository) {
                 this.broadClickRepository.incrementClick(broad)
                     .then(result => console.log(`[CLICK RECORDED BROAD] ${broad}, New Count: ${result.count}`))
@@ -1109,20 +1110,13 @@ export class RedirectController {
             let domain: string;
 
             if (globalRanking && globalRanking.length > 0) {
-                if (visitIndex < globalRanking.length) {
-                    // Visita N -> pega o N-esimo melhor eCPM global
-                    const linkInfo = globalRanking[visitIndex];
-                    redirectUrl = linkInfo.url;
-                    domain = linkInfo.domain;
-                    linkId = `rank${visitIndex}_db_${domain}_${linkInfo.postId}`;
-                    logType = `RANK #${visitIndex + 1} DB`;
-                } else {
-                    // Esgotou todos os links do ranking -> dominio aleatorio + /random
-                    domain = domains_db[Math.floor(Math.random() * domains_db.length)];
-                    redirectUrl = `https://${domain}${generateRandomPath()}`;
-                    linkId = `random_db_${domain}`;
-                    logType = 'RANDOM LINK DB';
-                }
+                // Esgotou o ranking -> volta pro primeiro (ciclo)
+                const idx = visitIndex % globalRanking.length;
+                const linkInfo = globalRanking[idx];
+                redirectUrl = linkInfo.url;
+                domain = linkInfo.domain;
+                linkId = `rank${idx}_db_${domain}_${linkInfo.postId}`;
+                logType = `RANK #${idx + 1} DB`;
             } else {
                 // Sem dados de ranking -> dominio aleatorio + /random
                 domain = domains_db[Math.floor(Math.random() * domains_db.length)];
@@ -1148,7 +1142,12 @@ export class RedirectController {
             // Defaults para UTMs caso nao tenham vindo na URL
             if (!allParams.has('utm_source')) allParams.set('utm_source', 'redron');
             if (!allParams.has('utm_medium')) allParams.set('utm_medium', 'broadcast');
-            if (!allParams.has('utm_campaign')) allParams.set('utm_campaign', linkId || 'direct');
+            const broad = req.query.broad as string;
+            if (broad) {
+                allParams.set('utm_campaign', broad);
+            } else if (!allParams.has('utm_campaign')) {
+                allParams.set('utm_campaign', linkId || 'direct');
+            }
 
             const separator = redirectUrl.includes('?') ? '&' : '?';
             const finalRedirectUrl = `${redirectUrl}${separator}${allParams.toString()}`;
@@ -1159,9 +1158,6 @@ export class RedirectController {
                     .then(result => console.log(`[CLICK RECORDED DB] LinkID: ${linkId}, New Count: ${result.count}`))
                     .catch(() => {});
             }
-
-            // Registrar click por broad (contador separado por data)
-            const broad = req.query.broad as string;
             if (broad && this.broadClickRepository) {
                 this.broadClickRepository.incrementClick(broad)
                     .then(result => console.log(`[CLICK RECORDED BROAD DB] ${broad}, New Count: ${result.count}`))
