@@ -9,7 +9,8 @@ import { RedirectClickRepository } from '../repositories/redirect-click-reposito
 import { BroadClickRepository } from '../repositories/broad-click-repository';
 import { IFilterRequest } from '../interfaces/filter-interfaces';
 import { redis } from '../config/redis';
-import { generateRandomPath, domains, domains_db } from '../config/domains';
+import { generateRandomPath, domains as fallbackDomainsList, domains_db as fallbackDomainsDbList } from '../config/domains';
+import { DomainGroupService } from '../services/domain-group-service';
 
 /**
  * Interface para um link com eCPM
@@ -67,13 +68,10 @@ export class RedirectController {
     private redirectClickRepository?: RedirectClickRepository;
     private broadClickRepository?: BroadClickRepository;
     private redisClient: typeof redis | null;
+    private domainGroupService: DomainGroupService;
 
     // Chaves Redis
-    private readonly BEST_LINKS_MAP_KEY = 'redirect:best_links_map';
     private readonly VISITOR_PREFIX = 'visitor';
-
-    // Chaves Redis para domains_db
-    private readonly BEST_LINKS_MAP_DB_KEY = 'redirect:best_links_map_db';
 
     // Chave Redis para regras de redirecionamento
     private readonly REDIRECT_RULES_KEY = 'redirect:rules';
@@ -81,14 +79,9 @@ export class RedirectController {
     // Chave Redis para regras de in-app
     private readonly INAPP_RULES_KEY = 'redirect:inapp_rules';
 
-    // Cache em memória para evitar chamadas repetidas ao Redis
-    private bestLinksMapCache: RankedLinksList | null = null;
-    private bestLinksMapCacheTime: number = 0;
+    // Cache genérico por slug: { data: RankedLinksList, time: number }
+    private bestLinksMapCaches: Map<string, { data: RankedLinksList; time: number }> = new Map();
     private readonly CACHE_TTL_MS = 60000; // 1 minuto de cache em memória
-
-    // Cache em memória para domains_db
-    private bestLinksMapDbCache: RankedLinksList | null = null;
-    private bestLinksMapDbCacheTime: number = 0;
 
     // Cache em memória para regras de redirecionamento
     private rulesCache: RedirectRule[] | null = null;
@@ -106,6 +99,7 @@ export class RedirectController {
     constructor(db?: Db) {
         this.superFilterService = new SuperFilterService();
         this.redisClient = redis;
+        this.domainGroupService = DomainGroupService.getInstance(db);
 
         if (db) {
             this.gamAdUnitRepository = new GamAdUnitRepository(db);
@@ -121,27 +115,31 @@ export class RedirectController {
     }
 
     /**
-     * Cron: a cada 15 minutos - busca ranking de eCPM de CADA dominio
+     * Retorna a chave Redis para o ranking de um grupo.
+     * Mantém compatibilidade com chaves antigas para 'main' e 'db'.
+     */
+    private getRedisKeyForGroup(slug: string): string {
+        if (slug === 'main') return 'redirect:best_links_map';
+        if (slug === 'db') return 'redirect:best_links_map_db';
+        return `redirect:best_links_map:${slug}`;
+    }
+
+    /**
+     * Cron: a cada 15 minutos - busca ranking de eCPM de TODOS os grupos ativos
      */
     private initializeScheduledProcess(): void {
         console.log('[CRON] Inicializando agendamento - executará a cada 15 minutos');
 
-        // Executar imediatamente na inicialização para popular o cache
-        this.executeProcessInternal()
-            .then(() => console.log('[CRON] Cache inicial populado com sucesso'))
+        // Executar imediatamente na inicialização para popular o cache de todos os grupos
+        this.executeAllGroups()
+            .then(() => console.log('[CRON] Cache inicial de todos os grupos populado com sucesso'))
             .catch(err => console.error('[CRON] Erro ao popular cache inicial:', err));
-
-        // Executar imediatamente para domains_db
-        this.executeProcessInternalDb()
-            .then(() => console.log('[CRON] Cache inicial DB populado com sucesso'))
-            .catch(err => console.error('[CRON] Erro ao popular cache inicial DB:', err));
 
         // Agendar para rodar a cada 15 minutos
         const task = cron.schedule('*/15 * * * *', async () => {
             console.log('[CRON] Executando atualização agendada...');
             try {
-                await this.executeProcessInternal();
-                await this.executeProcessInternalDb();
+                await this.executeAllGroups();
             } catch (error) {
                 console.error('[CRON] Erro:', error);
             }
@@ -150,100 +148,27 @@ export class RedirectController {
     }
 
     /**
-     * Busca em TODOS os dominios os posts e cria ranking global por eCPM (do maior para o menor)
-     * Salva no Redis uma lista: [{ url, domain, postId, ecpm }, ...]
+     * Executa o processo de ranking eCPM para TODOS os grupos ativos
      */
-    private async executeProcessInternal(): Promise<RankedLinksList | null> {
-        const date = new Date();
-        const today = new Date(date.getFullYear(), date.getMonth(), date.getDate());
-
-        const filterRequest: IFilterRequest = {
-            start: today.toISOString().split('T')[0],
-            end: today.toISOString().split('T')[0],
-            domain: domains,
-            custom_key: "id_post_wp",
-            group: ["domain", "custom_key", "custom_value"]
-        };
-
-        if (!this.gamAdUnitRepository) {
-            throw new Error('Database not connected');
-        }
-
-        const data = await this.superFilterService.execute(filterRequest, this.gamAdUnitRepository);
-
-        if (!Array.isArray(data) || data.length === 0) {
-            console.log('[CRON] Nenhum dado encontrado para processar');
-            return null;
-        }
-
-        // Criar lista global de todos os links
-        const globalRanking: RankedLinksList = [];
-
-        let skipped = 0;
-        for (const item of data) {
-            if (!item.domain || !item.custom_value) continue;
-
-            const impressions = Number(item.impressions || 0);
-            if (impressions < 100) {
-                skipped++;
-                continue;
+    private async executeAllGroups(): Promise<void> {
+        const slugs = await this.domainGroupService.getActiveSlugs();
+        for (const slug of slugs) {
+            try {
+                await this.executeProcessForGroup(slug);
+            } catch (error) {
+                console.error(`[CRON-${slug.toUpperCase()}] Erro:`, error);
             }
-
-            const domain = item.domain as string;
-            const ecpm = parseFloat(String(item.ecpm || 0));
-            const postId = String(item.custom_value);
-
-            globalRanking.push({
-                url: `https://${domain}/?p=${encodeURIComponent(postId)}`,
-                domain: domain,
-                postId: postId,
-                ecpm: ecpm
-            });
         }
-
-        // Ordenar por eCPM decrescente (ranking global)
-        globalRanking.sort((a, b) => b.ecpm - a.ecpm);
-
-        // Limitar a no máximo 10 posts por domínio
-        const domainCount = new Map<string, number>();
-        const limitedRanking = globalRanking.filter(link => {
-            const count = domainCount.get(link.domain) || 0;
-            if (count >= 10) return false;
-            domainCount.set(link.domain, count + 1);
-            return true;
-        });
-
-        // Validar posts via API WordPress (remover posts inexistentes)
-        const validatedRanking = await this.validateRanking(limitedRanking);
-
-        // Salvar no cache Redis (1 hora)
-        if (this.redisClient && validatedRanking.length > 0) {
-            await this.redisClient.set(
-                this.BEST_LINKS_MAP_KEY,
-                JSON.stringify(validatedRanking),
-                'EX',
-                3600
-            );
-            console.log(`[CRON] Ranking global atualizado: ${validatedRanking.length} links (${skipped} ignorados por <1000 impressões)`);
-        }
-
-        // Log do top 5
-        const top = validatedRanking.slice(0, 5);
-        for (let i = 0; i < top.length; i++) {
-            console.log(`[CRON] #${i + 1} ${top[i].domain} p=${top[i].postId} (eCPM: ${top[i].ecpm.toFixed(4)})`);
-        }
-
-        return validatedRanking;
     }
 
     /**
-     * Busca em domains_db os posts e cria ranking global por eCPM (do maior para o menor)
+     * Busca em todos os domínios de um grupo os posts e cria ranking global por eCPM (do maior para o menor).
      * Salva no Redis uma lista: [{ url, domain, postId, ecpm }, ...]
-     * Apenas links com >= 1000 impressões são incluídos
      */
-    private async executeProcessInternalDb(): Promise<RankedLinksList | null> {
-        if (domains_db.length === 0) {
-            console.log('[CRON-DB] Nenhum domínio configurado em domains_db');
+    private async executeProcessForGroup(slug: string): Promise<RankedLinksList | null> {
+        const groupDomains = await this.domainGroupService.getDomains(slug);
+        if (groupDomains.length === 0) {
+            console.log(`[CRON-${slug.toUpperCase()}] Nenhum domínio configurado`);
             return null;
         }
 
@@ -253,7 +178,7 @@ export class RedirectController {
         const filterRequest: IFilterRequest = {
             start: today.toISOString().split('T')[0],
             end: today.toISOString().split('T')[0],
-            domain: domains_db,
+            domain: groupDomains,
             custom_key: "id_post_wp",
             group: ["domain", "custom_key", "custom_value"]
         };
@@ -265,7 +190,7 @@ export class RedirectController {
         const data = await this.superFilterService.execute(filterRequest, this.gamAdUnitRepository);
 
         if (!Array.isArray(data) || data.length === 0) {
-            console.log('[CRON-DB] Nenhum dado encontrado para processar');
+            console.log(`[CRON-${slug.toUpperCase()}] Nenhum dado encontrado para processar`);
             return null;
         }
 
@@ -277,7 +202,7 @@ export class RedirectController {
             if (!item.domain || !item.custom_value) continue;
 
             const impressions = Number(item.impressions || 0);
-            if (impressions < 100) {
+            if (impressions < 500) {
                 skipped++;
                 continue;
             }
@@ -297,36 +222,34 @@ export class RedirectController {
         // Ordenar por eCPM decrescente (ranking global)
         globalRanking.sort((a, b) => b.ecpm - a.ecpm);
 
-        // Limitar a no máximo 10 posts por domínio
-        const domainCount = new Map<string, number>();
-        const limitedRanking = globalRanking.filter(link => {
-            const count = domainCount.get(link.domain) || 0;
-            if (count >= 10) return false;
-            domainCount.set(link.domain, count + 1);
-            return true;
-        });
+        // Validar posts via API WordPress ANTES de intercalar (senão /random seria removido)
+        const validatedRanking = await this.validateRanking(globalRanking);
 
-        // Validar posts via API WordPress (remover posts inexistentes)
-        const validatedRanking = await this.validateRanking(limitedRanking);
+        // Intercalar domínios (round-robin) — domínios sem dados entram como /random
+        const interleavedRanking = this.interleaveByDomain(validatedRanking, groupDomains);
+
+        // Pegar apenas os top 20 melhores eCPM (já intercalado com round-robin)
+        const topRanking = interleavedRanking.slice(0, 20);
 
         // Salvar no cache Redis (1 hora)
-        if (this.redisClient && validatedRanking.length > 0) {
+        const redisKey = this.getRedisKeyForGroup(slug);
+        if (this.redisClient && topRanking.length > 0) {
             await this.redisClient.set(
-                this.BEST_LINKS_MAP_DB_KEY,
-                JSON.stringify(validatedRanking),
+                redisKey,
+                JSON.stringify(topRanking),
                 'EX',
                 3600
             );
-            console.log(`[CRON-DB] Ranking global DB atualizado: ${validatedRanking.length} links (${skipped} ignorados por <1000 impressões)`);
+            console.log(`[CRON-${slug.toUpperCase()}] Ranking global atualizado: ${topRanking.length} links no rank (${validatedRanking.length} validados, ${skipped} ignorados por <500 impressões)`);
         }
 
         // Log do top 5
-        const top = validatedRanking.slice(0, 5);
+        const top = topRanking.slice(0, 5);
         for (let i = 0; i < top.length; i++) {
-            console.log(`[CRON-DB] #${i + 1} ${top[i].domain} p=${top[i].postId} (eCPM: ${top[i].ecpm.toFixed(4)})`);
+            console.log(`[CRON-${slug.toUpperCase()}] #${i + 1} ${top[i].domain} p=${top[i].postId} (eCPM: ${top[i].ecpm.toFixed(4)})`);
         }
 
-        return validatedRanking;
+        return topRanking;
     }
 
     /**
@@ -453,6 +376,58 @@ export class RedirectController {
     }
 
     /**
+     * Intercala links por domínio (round-robin) para evitar links consecutivos do mesmo domínio.
+     * Recebe o ranking já ordenado por eCPM decrescente.
+     * Em cada rodada, pega o próximo link de cada domínio (na ordem do melhor eCPM global do domínio).
+     */
+    private interleaveByDomain(ranking: RankedLinksList, allDomains: string[]): RankedLinksList {
+        // Agrupar links por domínio, mantendo a ordem de eCPM (já vem ordenado)
+        const domainGroups = new Map<string, LinkInfo[]>();
+
+        for (const link of ranking) {
+            if (!domainGroups.has(link.domain)) {
+                domainGroups.set(link.domain, []);
+            }
+            domainGroups.get(link.domain)!.push(link);
+        }
+
+        // Ordem dos domínios: primeiro os que têm dados (por melhor eCPM), depois os sem dados
+        const domainsWithData = allDomains.filter(d => domainGroups.has(d) && domainGroups.get(d)!.length > 0);
+        const domainsWithoutData = allDomains.filter(d => !domainGroups.has(d) || domainGroups.get(d)!.length === 0);
+
+        // Ordenar domínios com dados pelo melhor eCPM do primeiro link
+        domainsWithData.sort((a, b) => domainGroups.get(b)![0].ecpm - domainGroups.get(a)![0].ecpm);
+
+        const domainOrder = [...domainsWithData, ...domainsWithoutData];
+
+        // Descobrir o máximo de links que qualquer domínio tem
+        const maxLinks = Math.max(1, ...Array.from(domainGroups.values()).map(g => g.length));
+
+        // Round-robin: em cada rodada, passa por TODOS os domínios
+        // Se o domínio tem link na rodada -> usa o link
+        // Se não tem (sem dados ou já esgotou) -> /random daquele domínio
+        const result: RankedLinksList = [];
+
+        for (let round = 0; round < maxLinks; round++) {
+            for (const domain of domainOrder) {
+                const group = domainGroups.get(domain);
+                if (group && round < group.length) {
+                    result.push(group[round]);
+                } else {
+                    result.push({
+                        url: `https://${domain}${generateRandomPath()}`,
+                        domain: domain,
+                        postId: 'random',
+                        ecpm: 0
+                    });
+                }
+            }
+        }
+
+        return result;
+    }
+
+    /**
      * Filtra o ranking removendo posts que não existem no WordPress.
      * - Se a API respondeu com sucesso: filtra posts inexistentes.
      * - Se a API falhou E não tem cache anterior: remove todos os links do domínio.
@@ -503,19 +478,37 @@ export class RedirectController {
 
     /**
      * Endpoint manual: GET /api/process
+     * Aceita query param ?slug=main|db|... para executar um grupo específico.
+     * Sem slug, executa TODOS os grupos ativos e retorna todos os rankings.
      */
-    public async process(_req: Request, res: Response): Promise<void> {
+    public async process(req: Request, res: Response): Promise<void> {
         try {
-            const [mainData, dbData] = await Promise.all([
-                this.executeProcessInternal(),
-                this.executeProcessInternalDb()
-            ]);
-            res.status(200).json({
-                success: true,
-                message: 'Process executado - melhores links por dominio encontrados',
-                main: mainData,
-                db: dbData
-            });
+            const slugParam = typeof req.query.slug === 'string' ? req.query.slug : undefined;
+
+            if (slugParam) {
+                // Executar apenas o grupo solicitado
+                await this.executeProcessForGroup(slugParam);
+                const ranking = await this.getBestLinksMapForGroup(slugParam);
+                res.status(200).json({
+                    success: true,
+                    message: `Process executado para o grupo '${slugParam}'`,
+                    slug: slugParam,
+                    data: ranking
+                });
+            } else {
+                // Executar todos os grupos e retornar todos os rankings
+                await this.executeAllGroups();
+                const slugs = await this.domainGroupService.getActiveSlugs();
+                const allRankings: Record<string, RankedLinksList | null> = {};
+                for (const slug of slugs) {
+                    allRankings[slug] = await this.getBestLinksMapForGroup(slug);
+                }
+                res.status(200).json({
+                    success: true,
+                    message: 'Process executado para todos os grupos',
+                    data: allRankings
+                });
+            }
         } catch (error) {
             console.error('Error processing filter:', error);
             res.status(500).json({
@@ -528,9 +521,8 @@ export class RedirectController {
     /**
      * Gera a chave de visitante para rastreamento global
      * Formato: visitor:{type}:{ip}:{hora}
-     * type: 'main' para domains, 'db' para domains_db
      */
-    private getVisitorKey(ip: string, type: 'main' | 'db'): string {
+    private getVisitorKey(ip: string, type: string): string {
         const hour = new Date().getHours();
         return `${this.VISITOR_PREFIX}:${type}:${ip}:${hour}`;
     }
@@ -538,11 +530,8 @@ export class RedirectController {
     /**
      * Retorna a lista de domínios já visitados pelo IP nesta hora.
      */
-    private async getVisitedDomains(ip: string, type: 'main' | 'db'): Promise<string[]> {
-        if (!this.redisClient) return [];
-        const key = this.getVisitorKey(ip, type);
-        return await this.redisClient.smembers(key);
-    }
+    private async getVisitorVisitCount(ip: string, type: string): Promise<number> {
+        if (!this.redisClient) return 0;
 
     /**
      * Adiciona um domínio à lista de visitados e define TTL de 1h na primeira inserção.
@@ -561,55 +550,46 @@ export class RedirectController {
     }
 
     /**
-     * Obtem o mapa de melhores links do cache (com cache em memória)
+     * Obtem o ranking de melhores links de um grupo pelo slug (com cache em memória + Redis)
      */
-    private async getBestLinksMap(): Promise<RankedLinksList | null> {
+    private async getBestLinksMapForGroup(slug: string): Promise<RankedLinksList | null> {
         try {
-            // Verificar cache em memória primeiro
             const now = Date.now();
-            if (this.bestLinksMapCache && (now - this.bestLinksMapCacheTime) < this.CACHE_TTL_MS) {
-                return this.bestLinksMapCache;
+            const cached = this.bestLinksMapCaches.get(slug);
+
+            // Verificar cache em memória primeiro
+            if (cached && (now - cached.time) < this.CACHE_TTL_MS) {
+                return cached.data;
             }
 
-            if (!this.redisClient) return this.bestLinksMapCache;
+            if (!this.redisClient) return cached?.data || null;
 
-            const cached = await this.redisClient.get(this.BEST_LINKS_MAP_KEY);
-            if (cached) {
-                this.bestLinksMapCache = JSON.parse(cached) as RankedLinksList;
-                this.bestLinksMapCacheTime = now;
-                return this.bestLinksMapCache;
+            const redisKey = this.getRedisKeyForGroup(slug);
+            const redisData = await this.redisClient.get(redisKey);
+            if (redisData) {
+                const parsed = JSON.parse(redisData) as RankedLinksList;
+                this.bestLinksMapCaches.set(slug, { data: parsed, time: now });
+                return parsed;
             }
-            return this.bestLinksMapCache;
+            return cached?.data || null;
         } catch (error) {
-            console.error('Error getting best links map:', error);
-            return this.bestLinksMapCache;
+            console.error(`Error getting best links map for group ${slug}:`, error);
+            return this.bestLinksMapCaches.get(slug)?.data || null;
         }
     }
 
     /**
-     * Obtem o mapa de melhores links do cache para domains_db (com cache em memória)
+     * Wrapper de compatibilidade: retorna ranking do grupo 'main'
+     */
+    private async getBestLinksMap(): Promise<RankedLinksList | null> {
+        return this.getBestLinksMapForGroup('main');
+    }
+
+    /**
+     * Wrapper de compatibilidade: retorna ranking do grupo 'db'
      */
     private async getBestLinksMapDb(): Promise<RankedLinksList | null> {
-        try {
-            // Verificar cache em memória primeiro
-            const now = Date.now();
-            if (this.bestLinksMapDbCache && (now - this.bestLinksMapDbCacheTime) < this.CACHE_TTL_MS) {
-                return this.bestLinksMapDbCache;
-            }
-
-            if (!this.redisClient) return this.bestLinksMapDbCache;
-
-            const cached = await this.redisClient.get(this.BEST_LINKS_MAP_DB_KEY);
-            if (cached) {
-                this.bestLinksMapDbCache = JSON.parse(cached) as RankedLinksList;
-                this.bestLinksMapDbCacheTime = now;
-                return this.bestLinksMapDbCache;
-            }
-            return this.bestLinksMapDbCache;
-        } catch (error) {
-            console.error('Error getting best links map DB:', error);
-            return this.bestLinksMapDbCache;
-        }
+        return this.getBestLinksMapForGroup('db');
     }
 
     /**
@@ -967,47 +947,22 @@ export class RedirectController {
             let logType: string;
             let domain: string;
 
-            // Encontrar o próximo domínio não visitado (rotaciona por TODOS os domains)
-            const nextDomain = domains.find(d => !visitedSet.has(d));
-
-            if (nextDomain) {
-                domain = nextDomain;
-                // Verificar se esse domínio tem post no ranking
-                const linkInfo = globalRanking?.find(link => link.domain === domain);
-
-                if (linkInfo) {
-                    const foundIndex = globalRanking!.indexOf(linkInfo);
-                    redirectUrl = linkInfo.url;
-                    linkId = `rank${foundIndex}_${domain}_${linkInfo.postId}`;
-                    logType = `RANK #${foundIndex + 1}`;
-                } else {
-                    // Domínio sem ranking -> /random do domínio
-                    redirectUrl = `https://${domain}${generateRandomPath()}`;
-                    linkId = `random_${domain}`;
-                    logType = 'RANDOM (sem rank)';
-                }
-                // Registrar domínio como visitado
-                await this.addVisitedDomain(clientIp, 'main', domain);
+            if (globalRanking && globalRanking.length > 0) {
+                // Esgotou o ranking -> volta pro primeiro (ciclo)
+                const idx = visitIndex % globalRanking.length;
+                const linkInfo = globalRanking[idx];
+                redirectUrl = linkInfo.url;
+                domain = linkInfo.domain;
+                linkId = `rank${idx}_${domain}_${linkInfo.postId}`;
+                logType = `RANK #${idx + 1}`;
             } else {
-                // Todos os domínios já foram visitados -> volta pro primeiro da lista
-                domain = domains[0];
-                const linkInfo = globalRanking?.find(link => link.domain === domain);
-                if (linkInfo) {
-                    const foundIndex = globalRanking!.indexOf(linkInfo);
-                    redirectUrl = linkInfo.url;
-                    linkId = `rank${foundIndex}_${domain}_${linkInfo.postId}`;
-                    logType = `RANK #${foundIndex + 1} (reinício)`;
-                } else {
-                    redirectUrl = `https://${domain}${generateRandomPath()}`;
-                    linkId = `random_${domain}`;
-                    logType = 'RANDOM (reinício)';
-                }
-                // Limpar visitados e registrar o primeiro novamente
-                if (this.redisClient) {
-                    const key = this.getVisitorKey(clientIp, 'main');
-                    await this.redisClient.del(key);
-                }
-                await this.addVisitedDomain(clientIp, 'main', domain);
+                // Sem dados de ranking -> dominio aleatorio + /random
+                const mainDomains = await this.domainGroupService.getDomains('main');
+                domain = mainDomains[Math.floor(Math.random() * mainDomains.length)];
+                redirectUrl = `https://${domain}${generateRandomPath()}`;
+                linkId = `fallback_${domain}`;
+                logType = 'RANDOM LINK';
+                console.log(`[DEBUG] ranking global está VAZIO - rode /api/process para popular`);
             }
 
             // Dominios que NAO usam prefixo de idioma (vao "brutos")
@@ -1058,9 +1013,9 @@ export class RedirectController {
             // Defaults para UTMs caso nao tenham vindo na URL
             if (!allParams.has('utm_source')) allParams.set('utm_source', 'redron');
             if (!allParams.has('utm_medium')) allParams.set('utm_medium', 'broadcast');
-            const broadValue = req.query.broad as string;
-            if (broadValue) {
-                allParams.set('utm_campaign', broadValue);
+            const broad = req.query.broad as string;
+            if (broad) {
+                allParams.set('utm_campaign', broad);
             } else if (!allParams.has('utm_campaign')) {
                 allParams.set('utm_campaign', linkId || 'direct');
             }
@@ -1074,9 +1029,6 @@ export class RedirectController {
                     .then(result => console.log(`[CLICK RECORDED] LinkID: ${linkId}, New Count: ${result.count}`))
                     .catch(() => {});
             }
-
-            // Registrar click por broad (contador separado por data)
-            const broad = req.query.broad as string;
             if (broad && this.broadClickRepository) {
                 this.broadClickRepository.incrementClick(broad)
                     .then(result => console.log(`[CLICK RECORDED BROAD] ${broad}, New Count: ${result.count}`))
@@ -1108,7 +1060,8 @@ export class RedirectController {
                 return;
             }
 
-            if (domains_db.length === 0) {
+            const domainsDb = await this.domainGroupService.getDomains('db');
+            if (domainsDb.length === 0) {
                 res.status(503).json({ error: 'No domains_db configured' });
                 return;
             }
@@ -1164,47 +1117,21 @@ export class RedirectController {
             let logType: string;
             let domain: string;
 
-            // Encontrar o próximo domínio não visitado (rotaciona por TODOS os domains_db)
-            const nextDomain = domains_db.find(d => !visitedSet.has(d));
-
-            if (nextDomain) {
-                domain = nextDomain;
-                // Verificar se esse domínio tem post no ranking
-                const linkInfo = globalRanking?.find(link => link.domain === domain);
-
-                if (linkInfo) {
-                    const foundIndex = globalRanking!.indexOf(linkInfo);
-                    redirectUrl = linkInfo.url;
-                    linkId = `rank${foundIndex}_db_${domain}_${linkInfo.postId}`;
-                    logType = `RANK #${foundIndex + 1} DB`;
-                } else {
-                    // Domínio sem ranking -> /random do domínio
-                    redirectUrl = `https://${domain}${generateRandomPath()}`;
-                    linkId = `random_db_${domain}`;
-                    logType = 'RANDOM DB (sem rank)';
-                }
-                // Registrar domínio como visitado
-                await this.addVisitedDomain(clientIp, 'db', domain);
+            if (globalRanking && globalRanking.length > 0) {
+                // Esgotou o ranking -> volta pro primeiro (ciclo)
+                const idx = visitIndex % globalRanking.length;
+                const linkInfo = globalRanking[idx];
+                redirectUrl = linkInfo.url;
+                domain = linkInfo.domain;
+                linkId = `rank${idx}_db_${domain}_${linkInfo.postId}`;
+                logType = `RANK #${idx + 1} DB`;
             } else {
-                // Todos os domínios já foram visitados -> volta pro primeiro da lista
-                domain = domains_db[0];
-                const linkInfo = globalRanking?.find(link => link.domain === domain);
-                if (linkInfo) {
-                    const foundIndex = globalRanking!.indexOf(linkInfo);
-                    redirectUrl = linkInfo.url;
-                    linkId = `rank${foundIndex}_db_${domain}_${linkInfo.postId}`;
-                    logType = `RANK #${foundIndex + 1} DB (reinício)`;
-                } else {
-                    redirectUrl = `https://${domain}${generateRandomPath()}`;
-                    linkId = `random_db_${domain}`;
-                    logType = 'RANDOM DB (reinício)';
-                }
-                // Limpar visitados e registrar o primeiro novamente
-                if (this.redisClient) {
-                    const key = this.getVisitorKey(clientIp, 'db');
-                    await this.redisClient.del(key);
-                }
-                await this.addVisitedDomain(clientIp, 'db', domain);
+                // Sem dados de ranking -> dominio aleatorio + /random
+                domain = domainsDb[Math.floor(Math.random() * domainsDb.length)];
+                redirectUrl = `https://${domain}${generateRandomPath()}`;
+                linkId = `fallback_db_${domain}`;
+                logType = 'RANDOM LINK DB';
+                console.log(`[DEBUG-DB] ranking global DB está VAZIO - rode /api/process para popular`);
             }
 
             // domains_db não usa prefixo de idioma (/en/, /es/, etc)
@@ -1223,9 +1150,9 @@ export class RedirectController {
             // Defaults para UTMs caso nao tenham vindo na URL
             if (!allParams.has('utm_source')) allParams.set('utm_source', 'redron');
             if (!allParams.has('utm_medium')) allParams.set('utm_medium', 'broadcast');
-            const broadValue = req.query.broad as string;
-            if (broadValue) {
-                allParams.set('utm_campaign', broadValue);
+            const broad = req.query.broad as string;
+            if (broad) {
+                allParams.set('utm_campaign', broad);
             } else if (!allParams.has('utm_campaign')) {
                 allParams.set('utm_campaign', linkId || 'direct');
             }
@@ -1239,9 +1166,6 @@ export class RedirectController {
                     .then(result => console.log(`[CLICK RECORDED DB] LinkID: ${linkId}, New Count: ${result.count}`))
                     .catch(() => {});
             }
-
-            // Registrar click por broad (contador separado por data)
-            const broad = req.query.broad as string;
             if (broad && this.broadClickRepository) {
                 this.broadClickRepository.incrementClick(broad)
                     .then(result => console.log(`[CLICK RECORDED BROAD DB] ${broad}, New Count: ${result.count}`))
@@ -1257,8 +1181,136 @@ export class RedirectController {
         } catch (error) {
             console.error('Error in redirectDb:', error);
             // Fallback para primeiro dominio do domains_db
-            const fallbackDomain = domains_db[0] || 'appmynews.com';
+            const fallbackDomain = fallbackDomainsDbList[0] || 'appmynews.com';
             res.redirect(`https://${fallbackDomain}/random`);
+        }
+    }
+
+    /**
+     * Redirect generico para qualquer grupo de dominios (rotas dinamicas).
+     * Usa ranking eCPM do grupo, com fallback para dominio aleatorio + /random.
+     */
+    public async redirectByGroup(req: Request, res: Response, slug: string): Promise<void> {
+        try {
+            if (req.path.includes('favicon') || req.url.includes('favicon')) {
+                res.status(204).end();
+                return;
+            }
+
+            const groupDomains = await this.domainGroupService.getDomains(slug);
+            if (groupDomains.length === 0) {
+                res.status(503).json({ error: `No domains configured for group "${slug}"` });
+                return;
+            }
+
+            // Verificar regras de in-app/iframe
+            const utmCampaign = (req.query.utm_campaign as string) || (req.params.campaignId as string);
+            if (utmCampaign) {
+                const inAppRules = await this.getInAppRules();
+                const inAppMatch = inAppRules.find(r => r.active && r.utm_campaign === utmCampaign);
+
+                if (inAppMatch) {
+                    const inAppUrl = new URL(inAppMatch.destination);
+                    if (inAppMatch.passQueryParams) {
+                        for (const [key, value] of Object.entries(req.query)) {
+                            if (value) inAppUrl.searchParams.append(key, String(value));
+                        }
+                        if (req.params.campaignId) {
+                            inAppUrl.searchParams.append('utm_campaign', String(req.params.campaignId));
+                        }
+                    }
+                    const finalUrl = inAppUrl.toString();
+                    const userAgent = req.headers['user-agent'] || '';
+                    const isInApp = this.isInAppBrowser(userAgent);
+
+                    if (isInApp) {
+                        console.log(`[INAPP REDIRECT ${slug.toUpperCase()}] ${inAppMatch.id} campaign=${utmCampaign} -> ${finalUrl}`);
+                        res.redirect(finalUrl);
+                    } else {
+                        console.log(`[IFRAME ${slug.toUpperCase()}] ${inAppMatch.id} campaign=${utmCampaign} -> ${finalUrl}`);
+                        res.send(this.generateIframeHtml(finalUrl));
+                    }
+                    return;
+                }
+            }
+
+            // Identificar visitante por IP
+            const clientIp = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ||
+                           req.socket.remoteAddress || 'unknown';
+
+            // Contar visitas do visitante nesta hora
+            const visitIndex = await this.getVisitorVisitCount(clientIp, slug);
+
+            // Buscar ranking global de links do grupo
+            const globalRanking = await this.getBestLinksMapForGroup(slug);
+
+            let redirectUrl: string;
+            let linkId: string;
+            let logType: string;
+            let domain: string;
+
+            if (globalRanking && globalRanking.length > 0) {
+                // Esgotou o ranking -> volta pro primeiro (ciclo)
+                const idx = visitIndex % globalRanking.length;
+                const linkInfo = globalRanking[idx];
+                redirectUrl = linkInfo.url;
+                domain = linkInfo.domain;
+                linkId = `rank${idx}_${slug}_${domain}_${linkInfo.postId}`;
+                logType = `RANK #${idx + 1} ${slug.toUpperCase()}`;
+            } else {
+                // Sem dados de ranking -> dominio aleatorio + /random
+                domain = groupDomains[Math.floor(Math.random() * groupDomains.length)];
+                redirectUrl = `https://${domain}${generateRandomPath()}`;
+                linkId = `fallback_${slug}_${domain}`;
+                logType = `RANDOM LINK ${slug.toUpperCase()}`;
+                console.log(`[DEBUG-${slug.toUpperCase()}] ranking global está VAZIO - rode /api/process para popular`);
+            }
+
+            // Log
+            const visitInfo = ` (visita #${visitIndex + 1})`;
+            console.log(`[${logType}] ${domain}${visitInfo} -> ${redirectUrl}`);
+
+            // Repassa TODOS os query params recebidos, com defaults para UTMs
+            const allParams = new URLSearchParams();
+            for (const [key, value] of Object.entries(req.query)) {
+                if (value !== undefined && value !== null) {
+                    allParams.set(key, String(value));
+                }
+            }
+            // Defaults para UTMs caso nao tenham vindo na URL
+            if (!allParams.has('utm_source')) allParams.set('utm_source', 'redron');
+            if (!allParams.has('utm_medium')) allParams.set('utm_medium', 'broadcast');
+            const broad = req.query.broad as string;
+            if (broad) {
+                allParams.set('utm_campaign', broad);
+            } else if (!allParams.has('utm_campaign')) {
+                allParams.set('utm_campaign', linkId || 'direct');
+            }
+
+            const separator = redirectUrl.includes('?') ? '&' : '?';
+            const finalRedirectUrl = `${redirectUrl}${separator}${allParams.toString()}`;
+
+            // Registrar click
+            if (linkId && this.redirectClickRepository) {
+                this.redirectClickRepository.incrementClick(linkId)
+                    .then(result => console.log(`[CLICK RECORDED ${slug.toUpperCase()}] LinkID: ${linkId}, New Count: ${result.count}`))
+                    .catch(() => {});
+            }
+            if (broad && this.broadClickRepository) {
+                this.broadClickRepository.incrementClick(broad)
+                    .then(result => console.log(`[CLICK RECORDED BROAD ${slug.toUpperCase()}] ${broad}, New Count: ${result.count}`))
+                    .catch(() => {});
+            }
+
+            // Cache anti-duplicacao (fire and forget)
+            if (this.redisClient) {
+                this.redisClient.set(`recent:${clientIp}`, finalRedirectUrl, 'EX', 5).catch(() => {});
+            }
+
+            res.redirect(finalRedirectUrl);
+        } catch (error) {
+            console.error(`Error in redirectByGroup(${slug}):`, error);
+            res.status(500).json({ error: 'Internal server error' });
         }
     }
 
@@ -1411,8 +1463,8 @@ export class RedirectController {
                 gam: gamStats,
                 clicks: clickStats,
                 traffic: {
-                    totalDomains: domains.length,
-                    totalDomainsDb: domains_db.length,
+                    totalDomains: (await this.domainGroupService.getDomains('main')).length,
+                    totalDomainsDb: (await this.domainGroupService.getDomains('db')).length,
                     globalRanking: globalRanking,
                     globalRankingDb: globalRankingDb
                 }
