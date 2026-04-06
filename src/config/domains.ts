@@ -11,8 +11,8 @@ export const domains = [
     "promo.dopeaaps.com",
     "promo.appmobile4u.com",
     "cincosete.com",
-    // "finance.dopeaaps.com",
-    // "finance.appmobile4u.com",
+    "finance.dopeaaps.com",
+    "finance.appmobile4u.com",
 
 ];
 

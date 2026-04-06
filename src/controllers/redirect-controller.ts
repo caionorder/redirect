@@ -528,20 +528,25 @@ export class RedirectController {
     }
 
     /**
-     * Retorna quantas vezes o visitante ja acessou nesta hora (antes de incrementar)
-     * e incrementa o contador. TTL 1 hora.
+     * Retorna a lista de domínios já visitados pelo IP nesta hora.
      */
     private async getVisitorVisitCount(ip: string, type: string): Promise<number> {
         if (!this.redisClient) return 0;
 
+    /**
+     * Adiciona um domínio à lista de visitados e define TTL de 1h na primeira inserção.
+     */
+    private async addVisitedDomain(ip: string, type: 'main' | 'db', domain: string): Promise<void> {
+        if (!this.redisClient) return;
         const key = this.getVisitorKey(ip, type);
-        const count = await this.redisClient.incr(key);
-        // Setar TTL apenas na primeira visita (count === 1)
-        if (count === 1) {
-            await this.redisClient.expire(key, 3600);
+        const added = await this.redisClient.sadd(key, domain);
+        // Se foi o primeiro elemento adicionado, setar TTL
+        if (added === 1) {
+            const ttl = await this.redisClient.ttl(key);
+            if (ttl === -1) {
+                await this.redisClient.expire(key, 3600);
+            }
         }
-        // count=1 significa primeira visita (index 0), count=2 segunda (index 1), etc.
-        return count - 1;
     }
 
     /**
@@ -930,8 +935,9 @@ export class RedirectController {
             // Verificar idioma
             const language = req.query.language as string;
 
-            // Contar visitas do visitante nesta hora (ranking global, sem dominio)
-            const visitIndex = await this.getVisitorVisitCount(clientIp, 'main');
+            // Buscar domínios já visitados pelo IP nesta hora
+            const visitedDomains = await this.getVisitedDomains(clientIp, 'main');
+            const visitedSet = new Set(visitedDomains);
 
             // Buscar ranking global de links
             const globalRanking = await this.getBestLinksMap();
@@ -994,7 +1000,7 @@ export class RedirectController {
 
             // Log com informacao de idioma e dominio
             const langInfo = isNoLangDomain ? ' [BRUTO]' : (language ? ` [${language.toUpperCase()}]` : (isInvertedDomain ? ' [EN]' : ''));
-            const visitInfo = ` (visita #${visitIndex + 1})`;
+            const visitInfo = ` (visita #${visitedDomains.length + 1})`;
             console.log(`[${logType}]${langInfo} ${domain}${visitInfo} -> ${redirectUrl}`);
 
             // Repassa TODOS os query params recebidos, com defaults para UTMs
@@ -1099,8 +1105,9 @@ export class RedirectController {
             const clientIp = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ||
                            req.socket.remoteAddress || 'unknown';
 
-            // Contar visitas do visitante nesta hora (ranking global DB, sem dominio)
-            const visitIndex = await this.getVisitorVisitCount(clientIp, 'db');
+            // Buscar domínios já visitados pelo IP nesta hora
+            const visitedDomains = await this.getVisitedDomains(clientIp, 'db');
+            const visitedSet = new Set(visitedDomains);
 
             // Buscar ranking global de links DB
             const globalRanking = await this.getBestLinksMapDb();
@@ -1130,7 +1137,7 @@ export class RedirectController {
             // domains_db não usa prefixo de idioma (/en/, /es/, etc)
 
             // Log
-            const visitInfo = ` (visita #${visitIndex + 1})`;
+            const visitInfo = ` (visita #${visitedDomains.length + 1})`;
             console.log(`[${logType}] ${domain}${visitInfo} -> ${redirectUrl}`);
 
             // Repassa TODOS os query params recebidos, com defaults para UTMs
@@ -1314,77 +1321,52 @@ export class RedirectController {
                 return;
             }
 
-            // Parâmetro de ordenação: ecpm (default) ou clicks
             const sortBy = (req.query.sort as string) || 'clicks';
-            // Parâmetro de source: all (default), main, db
-            const source = (req.query.source as string) || 'all';
-            // Limite de resultados
             const limit = parseInt(req.query.limit as string) || 100;
 
-            // Buscar rankings do cache (memória/Redis)
             const [mainRanking, dbRanking] = await Promise.all([
-                (source === 'all' || source === 'main') ? this.getBestLinksMap() : null,
-                (source === 'all' || source === 'db') ? this.getBestLinksMapDb() : null
+                this.getBestLinksMap(),
+                this.getBestLinksMapDb()
             ]);
 
-            // Combinar rankings, marcando a origem
-            const combinedRanking: Array<LinkInfo & { source: string }> = [];
+            const buildRankResult = async (ranking: RankedLinksList | null) => {
+                if (!ranking || ranking.length === 0) return { rank: [], total: 0 };
 
-            if (mainRanking) {
-                for (const item of mainRanking) {
-                    combinedRanking.push({ ...item, source: 'main' });
+                const suffixSet = new Set<string>();
+                for (const item of ranking) {
+                    suffixSet.add(`${item.domain}_${item.postId}`);
                 }
-            }
-            if (dbRanking) {
-                for (const item of dbRanking) {
-                    combinedRanking.push({ ...item, source: 'db' });
+                const clickCountsMap = await this.redirectClickRepository!.getClickCountsBySuffixes(Array.from(suffixSet));
+
+                const result = ranking.map(item => {
+                    const suffix = `${item.domain}_${item.postId}`;
+                    return {
+                        url: item.url,
+                        domain: item.domain,
+                        postId: item.postId,
+                        ecpm: item.ecpm,
+                        clickCount: clickCountsMap.get(suffix) || 0
+                    };
+                });
+
+                if (sortBy === 'ecpm') {
+                    result.sort((a, b) => b.ecpm - a.ecpm);
+                } else {
+                    result.sort((a, b) => b.clickCount - a.clickCount);
                 }
-            }
 
-            if (combinedRanking.length === 0) {
-                res.status(200).json({ rank: [], total: 0 });
-                return;
-            }
+                return { rank: result.slice(0, limit), total: result.length };
+            };
 
-            // Construir sufixos únicos para busca bulk: domain_postId
-            const suffixSet = new Set<string>();
-            for (const item of combinedRanking) {
-                suffixSet.add(`${item.domain}_${item.postId}`);
-            }
-            const suffixes = Array.from(suffixSet);
-
-            // Busca bulk de click counts (uma única aggregation no MongoDB)
-            const clickCountsMap = await this.redirectClickRepository.getClickCountsBySuffixes(suffixes);
-
-            // Montar resultado combinado
-            const result = combinedRanking.map(item => {
-                const suffix = `${item.domain}_${item.postId}`;
-                return {
-                    url: item.url,
-                    domain: item.domain,
-                    postId: item.postId,
-                    ecpm: item.ecpm,
-                    clickCount: clickCountsMap.get(suffix) || 0,
-                    source: item.source
-                };
-            });
-
-            // Ordenar conforme parâmetro
-            if (sortBy === 'ecpm') {
-                result.sort((a, b) => b.ecpm - a.ecpm);
-            } else {
-                // Default: ordenar por clickCount desc
-                result.sort((a, b) => b.clickCount - a.clickCount);
-            }
-
-            // Aplicar limite
-            const limited = result.slice(0, limit);
+            const [mainResult, dbResult] = await Promise.all([
+                buildRankResult(mainRanking),
+                buildRankResult(dbRanking)
+            ]);
 
             res.status(200).json({
-                rank: limited,
-                total: result.length,
                 sort: sortBy,
-                source
+                main: mainResult,
+                db: dbResult
             });
         } catch (error) {
             console.error('Error getting rank:', error);
@@ -1409,6 +1391,50 @@ export class RedirectController {
             res.json(clicks);
         } catch (error) {
             console.error('[ERROR] getBroadClicks:', error);
+            res.status(500).json({ error: 'Internal server error' });
+        }
+    }
+
+    public async getRankByDomain(_req: Request, res: Response): Promise<void> {
+        try {
+            const [mainRanking, dbRanking] = await Promise.all([
+                this.getBestLinksMap(),
+                this.getBestLinksMapDb()
+            ]);
+
+            const groupByDomain = (ranking: RankedLinksList | null, source: string) => {
+                if (!ranking) return {};
+                const grouped: Record<string, Array<{ position: number; postId: string; url: string; ecpm: number; source: string }>> = {};
+                ranking.forEach((link, index) => {
+                    if (!grouped[link.domain]) grouped[link.domain] = [];
+                    grouped[link.domain].push({
+                        position: index + 1,
+                        postId: link.postId,
+                        url: link.url,
+                        ecpm: link.ecpm,
+                        source
+                    });
+                });
+                return grouped;
+            };
+
+            const mainGrouped = groupByDomain(mainRanking, 'main');
+            const dbGrouped = groupByDomain(dbRanking, 'db');
+
+            res.json({
+                main: {
+                    total_links: mainRanking?.length || 0,
+                    domains: Object.keys(mainGrouped).length,
+                    by_domain: mainGrouped
+                },
+                db: {
+                    total_links: dbRanking?.length || 0,
+                    domains: Object.keys(dbGrouped).length,
+                    by_domain: dbGrouped
+                }
+            });
+        } catch (error) {
+            console.error('[ERROR] getRankByDomain:', error);
             res.status(500).json({ error: 'Internal server error' });
         }
     }
