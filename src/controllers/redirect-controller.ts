@@ -229,7 +229,7 @@ export class RedirectController {
         const interleavedRanking = this.interleaveByDomain(validatedRanking, groupDomains);
 
         // Pegar apenas os top 20 melhores eCPM (já intercalado com round-robin)
-        const topRanking = interleavedRanking.slice(0, 20);
+        const topRanking = interleavedRanking.slice(0, 50);
 
         // Salvar no cache Redis (1 hora)
         const redisKey = this.getRedisKeyForGroup(slug);
