@@ -11,6 +11,7 @@ import { IFilterRequest } from '../interfaces/filter-interfaces';
 import { redis } from '../config/redis';
 import { generateRandomPath } from '../config/domains';
 import { DomainGroupService } from '../services/domain-group-service';
+import { PageviewService } from '../services/pageview-service';
 
 /**
  * Interface para um link com eCPM
@@ -20,6 +21,9 @@ interface LinkInfo {
     domain: string;
     postId: string;
     ecpm: number;
+    revenue: number;
+    uniqueVisitors: number;
+    rps: number;
 }
 
 /**
@@ -63,6 +67,7 @@ interface InAppRule {
 
 export class RedirectController {
     private superFilterService: SuperFilterService;
+    private pageviewService: PageviewService;
     private gamAdUnitRepository?: GamAdUnitRepository;
     private redirectLinkRepository?: RedirectLinkRepository;
     private redirectClickRepository?: RedirectClickRepository;
@@ -98,6 +103,7 @@ export class RedirectController {
 
     constructor(db?: Db) {
         this.superFilterService = new SuperFilterService();
+        this.pageviewService = new PageviewService();
         this.redisClient = redis;
         this.domainGroupService = DomainGroupService.getInstance(db);
 
@@ -162,8 +168,8 @@ export class RedirectController {
     }
 
     /**
-     * Busca em todos os domínios de um grupo os posts e cria ranking global por eCPM (do maior para o menor).
-     * Salva no Redis uma lista: [{ url, domain, postId, ecpm }, ...]
+     * Busca em todos os domínios de um grupo os posts e cria ranking global por RPS (do maior para o menor).
+     * Salva no Redis uma lista: [{ url, domain, postId, ecpm, revenue, uniqueVisitors, rps }, ...]
      */
     private async executeProcessForGroup(slug: string): Promise<RankedLinksList | null> {
         const groupDomains = await this.domainGroupService.getDomains(slug);
@@ -215,25 +221,53 @@ export class RedirectController {
                 url: `https://${domain}/?p=${encodeURIComponent(postId)}`,
                 domain: domain,
                 postId: postId,
-                ecpm: ecpm
+                ecpm: ecpm,
+                revenue: Number(item.revenue || 0),
+                uniqueVisitors: 0,
+                rps: 0
             });
         }
 
-        // Ordenar por eCPM decrescente (ranking global)
-        globalRanking.sort((a, b) => b.ecpm - a.ecpm);
+        // Buscar unique visitors em paralelo para calcular RPS
+        const todayStr = today.toISOString().split('T')[0];
+        const pageviewMap = await this.pageviewService.fetchBulkPageviews(
+            globalRanking.map(item => ({ domain: item.domain, postId: item.postId })),
+            todayStr
+        );
+
+        for (const item of globalRanking) {
+            const pv = pageviewMap.get(`${item.domain}_${item.postId}`);
+            if (pv) {
+                item.uniqueVisitors = pv.unique;
+                if (pv.unique > 0) {
+                    item.rps = item.revenue / pv.unique;
+                }
+            }
+        }
+
+        // Filtrar itens com menos de 10 unique visitors (RPS distorcido)
+        const filteredRanking = globalRanking.filter(item => item.uniqueVisitors >= 10);
+
+        // Ordenar por RPS decrescente (ranking global)
+        filteredRanking.sort((a, b) => b.rps - a.rps);
 
         // Validar posts via API WordPress ANTES de intercalar (senão /random seria removido)
-        const validatedRanking = await this.validateRanking(globalRanking);
+        const validatedRanking = await this.validateRanking(filteredRanking);
+
+        // Se não sobrou nenhum post real, manter o cache anterior
+        if (validatedRanking.length === 0) {
+            console.log(`[CRON-${slug.toUpperCase()}] Nenhum post com RPS válido — mantendo cache anterior`);
+            return null;
+        }
 
         // Intercalar domínios (round-robin) — domínios sem dados entram como /random
         const interleavedRanking = this.interleaveByDomain(validatedRanking, groupDomains);
 
-        // Pegar apenas os top 20 melhores eCPM (já intercalado com round-robin)
         const topRanking = interleavedRanking.slice(0, 50);
 
         // Salvar no cache Redis (1 hora)
         const redisKey = this.getRedisKeyForGroup(slug);
-        if (this.redisClient && topRanking.length > 0) {
+        if (this.redisClient) {
             await this.redisClient.set(
                 redisKey,
                 JSON.stringify(topRanking),
@@ -246,7 +280,7 @@ export class RedirectController {
         // Log do top 5
         const top = topRanking.slice(0, 5);
         for (let i = 0; i < top.length; i++) {
-            console.log(`[CRON-${slug.toUpperCase()}] #${i + 1} ${top[i].domain} p=${top[i].postId} (eCPM: ${top[i].ecpm.toFixed(4)})`);
+            console.log(`[CRON-${slug.toUpperCase()}] #${i + 1} ${top[i].domain} p=${top[i].postId} (RPS: ${top[i].rps.toFixed(6)}, eCPM: ${top[i].ecpm.toFixed(4)}, uniques: ${top[i].uniqueVisitors})`);
         }
 
         return topRanking;
@@ -418,7 +452,10 @@ export class RedirectController {
                         url: `https://${domain}${generateRandomPath()}`,
                         domain: domain,
                         postId: 'random',
-                        ecpm: 0
+                        ecpm: 0,
+                        revenue: 0,
+                        uniqueVisitors: 0,
+                        rps: 0
                     });
                 }
             }
