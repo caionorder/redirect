@@ -9,7 +9,7 @@ import { RedirectClickRepository } from '../repositories/redirect-click-reposito
 import { BroadClickRepository } from '../repositories/broad-click-repository';
 import { IFilterRequest } from '../interfaces/filter-interfaces';
 import { redis } from '../config/redis';
-import { generateRandomPath, domains as fallbackDomainsList, domains_db as fallbackDomainsDbList } from '../config/domains';
+import { generateRandomPath } from '../config/domains';
 import { DomainGroupService } from '../services/domain-group-service';
 
 /**
@@ -945,9 +945,8 @@ export class RedirectController {
             // Verificar idioma
             const language = req.query.language as string;
 
-            // Buscar domínios já visitados pelo IP nesta hora
-            const visitedDomains = await this.getVisitedDomains(clientIp, 'main');
-            const visitedSet = new Set(visitedDomains);
+            // Contar visitas do visitante nesta hora (ranking global, sem dominio)
+            const visitIndex = await this.getVisitorVisitCount(clientIp, 'main');
 
             // Buscar ranking global de links
             const globalRanking = await this.getBestLinksMap();
@@ -1010,7 +1009,7 @@ export class RedirectController {
 
             // Log com informacao de idioma e dominio
             const langInfo = isNoLangDomain ? ' [BRUTO]' : (language ? ` [${language.toUpperCase()}]` : (isInvertedDomain ? ' [EN]' : ''));
-            const visitInfo = ` (visita #${visitedDomains.length + 1})`;
+            const visitInfo = ` (visita #${visitIndex + 1})`;
             console.log(`[${logType}]${langInfo} ${domain}${visitInfo} -> ${redirectUrl}`);
 
             // Repassa TODOS os query params recebidos, com defaults para UTMs
@@ -1054,145 +1053,6 @@ export class RedirectController {
         } catch (error) {
             console.error('Error in redirect:', error);
             res.redirect('https://useuapp.com/random');
-        }
-    }
-
-    /**
-     * Redirect para domains_db com mesma logica:
-     * - Rotaciona dominios_db sequencialmente
-     * - Se visitante ja viu o dominio naquela hora -> /random
-     * - Se primeira visita -> melhor link do dominio
-     */
-    public async redirectDb(req: Request, res: Response): Promise<void> {
-        try {
-            if (req.path.includes('favicon') || req.url.includes('favicon')) {
-                res.status(204).end();
-                return;
-            }
-
-            const domainsDb = await this.domainGroupService.getDomains('db');
-            if (domainsDb.length === 0) {
-                res.status(503).json({ error: 'No domains_db configured' });
-                return;
-            }
-
-            // Verificar regras de in-app/iframe
-            // utm_campaign pode vir da query string OU do path (/db/:campaignId)
-            const utmCampaignDb = (req.query.utm_campaign as string) || (req.params.campaignId as string);
-            if (utmCampaignDb) {
-                const inAppRules = await this.getInAppRules();
-                const inAppMatch = inAppRules.find(r => r.active && r.utm_campaign === utmCampaignDb);
-
-                if (inAppMatch) {
-                    const inAppUrl = new URL(inAppMatch.destination);
-                    if (inAppMatch.passQueryParams) {
-                        for (const [key, value] of Object.entries(req.query)) {
-                            if (value) inAppUrl.searchParams.append(key, String(value));
-                        }
-                        // Se veio do path, adicionar como utm_campaign
-                        if (req.params.campaignId) {
-                            inAppUrl.searchParams.append('utm_campaign', String(req.params.campaignId));
-                        }
-                    }
-                    const finalUrl = inAppUrl.toString();
-                    const userAgent = req.headers['user-agent'] || '';
-                    const isInApp = this.isInAppBrowser(userAgent);
-
-                    if (isInApp) {
-                        // In-app (Facebook/Instagram) -> redirect para destino
-                        console.log(`[INAPP REDIRECT DB] ${inAppMatch.id} campaign=${utmCampaignDb} -> ${finalUrl}`);
-                        res.redirect(finalUrl);
-                    } else {
-                        // Não é in-app (Meta crawler, navegador normal) -> iframe
-                        console.log(`[IFRAME DB] ${inAppMatch.id} campaign=${utmCampaignDb} -> ${finalUrl}`);
-                        res.send(this.generateIframeHtml(finalUrl));
-                    }
-                    return;
-                }
-            }
-
-            // Identificar visitante por IP
-            const clientIp = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ||
-                           req.socket.remoteAddress || 'unknown';
-
-            // Buscar domínios já visitados pelo IP nesta hora
-            const visitedDomains = await this.getVisitedDomains(clientIp, 'db');
-            const visitedSet = new Set(visitedDomains);
-
-            // Buscar ranking global de links DB
-            const globalRanking = await this.getBestLinksMapDb();
-
-            let redirectUrl: string;
-            let linkId: string;
-            let logType: string;
-            let domain: string;
-
-            if (globalRanking && globalRanking.length > 0) {
-                // Esgotou o ranking -> volta pro primeiro (ciclo)
-                const idx = visitIndex % globalRanking.length;
-                const linkInfo = globalRanking[idx];
-                redirectUrl = linkInfo.url;
-                domain = linkInfo.domain;
-                linkId = `rank${idx}_db_${domain}_${linkInfo.postId}`;
-                logType = `RANK #${idx + 1} DB`;
-            } else {
-                // Sem dados de ranking -> dominio aleatorio + /random
-                domain = domainsDb[Math.floor(Math.random() * domainsDb.length)];
-                redirectUrl = `https://${domain}${generateRandomPath()}`;
-                linkId = `fallback_db_${domain}`;
-                logType = 'RANDOM LINK DB';
-                console.log(`[DEBUG-DB] ranking global DB está VAZIO - rode /api/process para popular`);
-            }
-
-            // domains_db não usa prefixo de idioma (/en/, /es/, etc)
-
-            // Log
-            const visitInfo = ` (visita #${visitedDomains.length + 1})`;
-            console.log(`[${logType}] ${domain}${visitInfo} -> ${redirectUrl}`);
-
-            // Repassa TODOS os query params recebidos, com defaults para UTMs
-            const allParams = new URLSearchParams();
-            for (const [key, value] of Object.entries(req.query)) {
-                if (value !== undefined && value !== null) {
-                    allParams.set(key, String(value));
-                }
-            }
-            // Defaults para UTMs caso nao tenham vindo na URL
-            if (!allParams.has('utm_source')) allParams.set('utm_source', 'redron');
-            if (!allParams.has('utm_medium')) allParams.set('utm_medium', 'broadcast');
-            const broad = req.query.broad as string;
-            if (broad) {
-                allParams.set('utm_campaign', broad);
-            } else if (!allParams.has('utm_campaign')) {
-                allParams.set('utm_campaign', linkId || 'direct');
-            }
-
-            const separator = redirectUrl.includes('?') ? '&' : '?';
-            const finalRedirectUrl = `${redirectUrl}${separator}${allParams.toString()}`;
-
-            // Registrar click
-            if (linkId && this.redirectClickRepository) {
-                this.redirectClickRepository.incrementClick(linkId)
-                    .then(result => console.log(`[CLICK RECORDED DB] LinkID: ${linkId}, New Count: ${result.count}`))
-                    .catch(() => {});
-            }
-            if (broad && this.broadClickRepository) {
-                this.broadClickRepository.incrementClick(broad)
-                    .then(result => console.log(`[CLICK RECORDED BROAD DB] ${broad}, New Count: ${result.count}`))
-                    .catch(() => {});
-            }
-
-            // Cache anti-duplicacao (fire and forget)
-            if (this.redisClient) {
-                this.redisClient.set(`recent:${clientIp}`, finalRedirectUrl, 'EX', 5).catch(() => {});
-            }
-
-            res.redirect(finalRedirectUrl);
-        } catch (error) {
-            console.error('Error in redirectDb:', error);
-            // Fallback para primeiro dominio do domains_db
-            const fallbackDomain = fallbackDomainsDbList[0] || 'appmynews.com';
-            res.redirect(`https://${fallbackDomain}/random`);
         }
     }
 

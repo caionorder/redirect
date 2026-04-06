@@ -124,7 +124,7 @@ export async function createApp(): Promise<Express> {
         app.get('/', (req, res) => redirectController.redirect(req, res));
 
         // Rota "/db" executa o redirect usando grupo "db"
-        app.get('/db', (req, res) => redirectController.redirectDb(req, res));
+        app.get('/db', (req, res) => redirectController.redirectByGroup(req, res, 'db'));
 
         // Montar as rotas em /api (antes das rotas com :campaignId para não conflitar)
         app.use('/api', createRedirectRouter(db));
@@ -146,7 +146,7 @@ export async function createApp(): Promise<Express> {
         }
 
         // Rotas com campaignId no path (ex: /120242094780560734 ou /db/120242094780560734)
-        app.get('/db/:campaignId', (req, res) => redirectController.redirectDb(req, res));
+        app.get('/db/:campaignId', (req, res) => redirectController.redirectByGroup(req, res, 'db'));
         app.get('/:campaignId', (req, res) => redirectController.redirect(req, res));
     } else {
         // Rota de fallback se não houver DB
