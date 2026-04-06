@@ -221,13 +221,15 @@ export class RedirectController {
 
         // Ordenar por eCPM decrescente (ranking global)
         globalRanking.sort((a, b) => b.ecpm - a.ecpm);
-        const interleavedRanking = this.interleaveByDomain(globalRanking);
 
-        // Validar posts via API WordPress (remover posts inexistentes)
-        const validatedRanking = await this.validateRanking(interleavedRanking);
+        // Validar posts via API WordPress ANTES de intercalar (senão /random seria removido)
+        const validatedRanking = await this.validateRanking(globalRanking);
 
-        // Pegar apenas os top 20 melhores eCPM (já está ordenado desc)
-        const topRanking = validatedRanking.slice(0, 20);
+        // Intercalar domínios (round-robin) — domínios sem dados entram como /random
+        const interleavedRanking = this.interleaveByDomain(validatedRanking, groupDomains);
+
+        // Pegar apenas os top 20 melhores eCPM (já intercalado com round-robin)
+        const topRanking = interleavedRanking.slice(0, 20);
 
         // Salvar no cache Redis (1 hora)
         const redisKey = this.getRedisKeyForGroup(slug);
@@ -378,39 +380,47 @@ export class RedirectController {
      * Recebe o ranking já ordenado por eCPM decrescente.
      * Em cada rodada, pega o próximo link de cada domínio (na ordem do melhor eCPM global do domínio).
      */
-    private interleaveByDomain(ranking: RankedLinksList): RankedLinksList {
-        if (ranking.length === 0) return ranking;
-
+    private interleaveByDomain(ranking: RankedLinksList, allDomains: string[]): RankedLinksList {
         // Agrupar links por domínio, mantendo a ordem de eCPM (já vem ordenado)
         const domainGroups = new Map<string, LinkInfo[]>();
-        const domainOrder: string[] = [];
 
         for (const link of ranking) {
             if (!domainGroups.has(link.domain)) {
                 domainGroups.set(link.domain, []);
-                domainOrder.push(link.domain);
             }
             domainGroups.get(link.domain)!.push(link);
         }
 
-        // Round-robin: em cada rodada, pega o próximo de cada domínio
-        const result: RankedLinksList = [];
-        let hasMore = true;
-        let round = 0;
+        // Ordem dos domínios: primeiro os que têm dados (por melhor eCPM), depois os sem dados
+        const domainsWithData = allDomains.filter(d => domainGroups.has(d) && domainGroups.get(d)!.length > 0);
+        const domainsWithoutData = allDomains.filter(d => !domainGroups.has(d) || domainGroups.get(d)!.length === 0);
 
-        while (hasMore) {
-            hasMore = false;
+        // Ordenar domínios com dados pelo melhor eCPM do primeiro link
+        domainsWithData.sort((a, b) => domainGroups.get(b)![0].ecpm - domainGroups.get(a)![0].ecpm);
+
+        const domainOrder = [...domainsWithData, ...domainsWithoutData];
+
+        // Descobrir o máximo de links que qualquer domínio tem
+        const maxLinks = Math.max(1, ...Array.from(domainGroups.values()).map(g => g.length));
+
+        // Round-robin: em cada rodada, passa por TODOS os domínios
+        // Se o domínio tem link na rodada -> usa o link
+        // Se não tem (sem dados ou já esgotou) -> /random daquele domínio
+        const result: RankedLinksList = [];
+
+        for (let round = 0; round < maxLinks; round++) {
             for (const domain of domainOrder) {
-                const group = domainGroups.get(domain)!;
-                if (round < group.length) {
+                const group = domainGroups.get(domain);
+                if (group && round < group.length) {
                     result.push(group[round]);
-                    hasMore = true;
+                } else {
+                    result.push({
+                        url: `https://${domain}${generateRandomPath()}`,
+                        domain: domain,
+                        postId: 'random',
+                        ecpm: 0
+                    });
                 }
-            }
-            round++;
-            // Verificar se ainda há links na próxima rodada
-            if (hasMore) {
-                hasMore = domainOrder.some(d => round < domainGroups.get(d)!.length);
             }
         }
 
@@ -468,18 +478,37 @@ export class RedirectController {
 
     /**
      * Endpoint manual: GET /api/process
-     * Executa o processo de ranking para TODOS os grupos ativos
+     * Aceita query param ?slug=main|db|... para executar um grupo específico.
+     * Sem slug, executa TODOS os grupos ativos e retorna todos os rankings.
      */
-    public async process(_req: Request, res: Response): Promise<void> {
+    public async process(req: Request, res: Response): Promise<void> {
         try {
-            await this.executeAllGroups();
-            // Retornar o ranking do grupo 'main' como resposta (compatibilidade)
-            const mainRanking = await this.getBestLinksMapForGroup('main');
-            res.status(200).json({
-                success: true,
-                message: 'Process executado para todos os grupos - melhores links por dominio encontrados',
-                data: mainRanking
-            });
+            const slugParam = typeof req.query.slug === 'string' ? req.query.slug : undefined;
+
+            if (slugParam) {
+                // Executar apenas o grupo solicitado
+                await this.executeProcessForGroup(slugParam);
+                const ranking = await this.getBestLinksMapForGroup(slugParam);
+                res.status(200).json({
+                    success: true,
+                    message: `Process executado para o grupo '${slugParam}'`,
+                    slug: slugParam,
+                    data: ranking
+                });
+            } else {
+                // Executar todos os grupos e retornar todos os rankings
+                await this.executeAllGroups();
+                const slugs = await this.domainGroupService.getActiveSlugs();
+                const allRankings: Record<string, RankedLinksList | null> = {};
+                for (const slug of slugs) {
+                    allRankings[slug] = await this.getBestLinksMapForGroup(slug);
+                }
+                res.status(200).json({
+                    success: true,
+                    message: 'Process executado para todos os grupos',
+                    data: allRankings
+                });
+            }
         } catch (error) {
             console.error('Error processing filter:', error);
             res.status(500).json({
