@@ -228,7 +228,10 @@ export class RedirectController {
             });
         }
 
-        // Buscar unique visitors em paralelo para calcular RPS
+        // Ordenar por revenue desc antes de buscar pageviews (prioriza quem gera mais receita)
+        globalRanking.sort((a, b) => b.revenue - a.revenue);
+
+        // Buscar unique visitors sequencialmente (1 a 1) para calcular RPS
         const todayStr = today.toISOString().split('T')[0];
         const pageviewMap = await this.pageviewService.fetchBulkPageviews(
             globalRanking.map(item => ({ domain: item.domain, postId: item.postId })),
@@ -429,8 +432,8 @@ export class RedirectController {
         const domainsWithData = allDomains.filter(d => domainGroups.has(d) && domainGroups.get(d)!.length > 0);
         const domainsWithoutData = allDomains.filter(d => !domainGroups.has(d) || domainGroups.get(d)!.length === 0);
 
-        // Ordenar domínios com dados pelo melhor eCPM do primeiro link
-        domainsWithData.sort((a, b) => domainGroups.get(b)![0].ecpm - domainGroups.get(a)![0].ecpm);
+        // Ordenar domínios com dados pelo melhor RPS do primeiro link
+        domainsWithData.sort((a, b) => domainGroups.get(b)![0].rps - domainGroups.get(a)![0].rps);
 
         const domainOrder = [...domainsWithData, ...domainsWithoutData];
 

@@ -53,21 +53,25 @@ export class PageviewService {
     }
 
     /**
-     * Busca pageviews em paralelo para múltiplos itens.
+     * Busca pageviews com throttle (3 simultâneas por vez) para não sobrecarregar a API.
+     * Items devem vir já ordenados por revenue desc (quem gera mais receita primeiro).
      * Retorna um Map onde a key é `${domain}_${postId}` e o valor é { pageview, unique }.
      */
-    async fetchBulkPageviews(items: BulkPageviewItem[], date: string): Promise<Map<string, PageviewResult>> {
-        const results = await Promise.allSettled(
-            items.map(item => this.fetchPageviews(item.domain, item.postId, date))
-        );
-
+    async fetchBulkPageviews(items: BulkPageviewItem[], date: string, concurrency: number = 3): Promise<Map<string, PageviewResult>> {
         const map = new Map<string, PageviewResult>();
 
-        for (let i = 0; i < items.length; i++) {
-            const result = results[i];
-            if (result.status === 'fulfilled' && result.value) {
-                const key = `${items[i].domain}_${items[i].postId}`;
-                map.set(key, result.value);
+        for (let i = 0; i < items.length; i += concurrency) {
+            const batch = items.slice(i, i + concurrency);
+            const results = await Promise.allSettled(
+                batch.map(item => this.fetchPageviews(item.domain, item.postId, date))
+            );
+
+            for (let j = 0; j < batch.length; j++) {
+                const result = results[j];
+                if (result.status === 'fulfilled' && result.value) {
+                    const key = `${batch[j].domain}_${batch[j].postId}`;
+                    map.set(key, result.value);
+                }
             }
         }
 
