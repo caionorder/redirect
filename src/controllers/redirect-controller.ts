@@ -533,6 +533,16 @@ export class RedirectController {
     private async getVisitorVisitCount(ip: string, type: string): Promise<number> {
         if (!this.redisClient) return 0;
 
+        const key = this.getVisitorKey(ip, type);
+        const count = await this.redisClient.incr(key);
+        // Setar TTL apenas na primeira visita (count === 1)
+        if (count === 1) {
+            await this.redisClient.expire(key, 3600);
+        }
+        // count=1 significa primeira visita (index 0), count=2 segunda (index 1), etc.
+        return count - 1;
+    }
+
     /**
      * Adiciona um domínio à lista de visitados e define TTL de 1h na primeira inserção.
      */
