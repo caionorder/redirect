@@ -202,7 +202,7 @@ export class RedirectController {
             if (!item.domain || !item.custom_value) continue;
 
             const impressions = Number(item.impressions || 0);
-            if (impressions < 500) {
+            if (impressions < 50) {
                 skipped++;
                 continue;
             }
@@ -240,7 +240,7 @@ export class RedirectController {
                 'EX',
                 3600
             );
-            console.log(`[CRON-${slug.toUpperCase()}] Ranking global atualizado: ${topRanking.length} links no rank (${validatedRanking.length} validados, ${skipped} ignorados por <500 impressões)`);
+            console.log(`[CRON-${slug.toUpperCase()}] Ranking global atualizado: ${topRanking.length} links no rank (${validatedRanking.length} validados, ${skipped} ignorados por <50 impressões)`);
         }
 
         // Log do top 5
