@@ -58,8 +58,8 @@ EOL
                     sh '''
                         ssh -o StrictHostKeyChecking=no -p 22022 root@64.23.139.53 "
                             docker pull ghcr.io/caionorder/redirect:latest && \
-                            docker stop redirect || true && \
-                            docker rm redirect || true && \
+                            docker stop norder-redirect || true && \
+                            docker rm norder-redirect || true && \
                             docker run -d --restart=always --name norder-redirect --network joinads -p 6969:3000 ghcr.io/caionorder/redirect:latest
                         "
                     '''
