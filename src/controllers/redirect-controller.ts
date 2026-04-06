@@ -202,7 +202,7 @@ export class RedirectController {
             if (!item.domain || !item.custom_value) continue;
 
             const impressions = Number(item.impressions || 0);
-            if (impressions < 100) {
+            if (impressions < 500) {
                 skipped++;
                 continue;
             }
@@ -221,9 +221,10 @@ export class RedirectController {
 
         // Ordenar por eCPM decrescente (ranking global)
         globalRanking.sort((a, b) => b.ecpm - a.ecpm);
+        const interleavedRanking = this.interleaveByDomain(globalRanking);
 
         // Validar posts via API WordPress (remover posts inexistentes)
-        const validatedRanking = await this.validateRanking(globalRanking);
+        const validatedRanking = await this.validateRanking(interleavedRanking);
 
         // Pegar apenas os top 20 melhores eCPM (já está ordenado desc)
         const topRanking = validatedRanking.slice(0, 20);
@@ -237,7 +238,7 @@ export class RedirectController {
                 'EX',
                 3600
             );
-            console.log(`[CRON-${slug.toUpperCase()}] Ranking global atualizado: ${topRanking.length} links no rank (${validatedRanking.length} validados, ${skipped} ignorados por <100 impressões)`);
+            console.log(`[CRON-${slug.toUpperCase()}] Ranking global atualizado: ${topRanking.length} links no rank (${validatedRanking.length} validados, ${skipped} ignorados por <500 impressões)`);
         }
 
         // Log do top 5
@@ -368,6 +369,50 @@ export class RedirectController {
         // Atualizar cache apenas com resultados bem-sucedidos
         this.validPostsCache = result;
         this.validPostsCacheTime = now;
+
+        return result;
+    }
+
+    /**
+     * Intercala links por domínio (round-robin) para evitar links consecutivos do mesmo domínio.
+     * Recebe o ranking já ordenado por eCPM decrescente.
+     * Em cada rodada, pega o próximo link de cada domínio (na ordem do melhor eCPM global do domínio).
+     */
+    private interleaveByDomain(ranking: RankedLinksList): RankedLinksList {
+        if (ranking.length === 0) return ranking;
+
+        // Agrupar links por domínio, mantendo a ordem de eCPM (já vem ordenado)
+        const domainGroups = new Map<string, LinkInfo[]>();
+        const domainOrder: string[] = [];
+
+        for (const link of ranking) {
+            if (!domainGroups.has(link.domain)) {
+                domainGroups.set(link.domain, []);
+                domainOrder.push(link.domain);
+            }
+            domainGroups.get(link.domain)!.push(link);
+        }
+
+        // Round-robin: em cada rodada, pega o próximo de cada domínio
+        const result: RankedLinksList = [];
+        let hasMore = true;
+        let round = 0;
+
+        while (hasMore) {
+            hasMore = false;
+            for (const domain of domainOrder) {
+                const group = domainGroups.get(domain)!;
+                if (round < group.length) {
+                    result.push(group[round]);
+                    hasMore = true;
+                }
+            }
+            round++;
+            // Verificar se ainda há links na próxima rodada
+            if (hasMore) {
+                hasMore = domainOrder.some(d => round < domainGroups.get(d)!.length);
+            }
+        }
 
         return result;
     }
