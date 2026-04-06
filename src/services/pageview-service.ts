@@ -1,5 +1,5 @@
 const PAGEVIEW_API_URL = 'https://pageview.joinads.me/api/report-all/0f99f85f-ae1f-4028-a414-b47b1740083e';
-const TIMEOUT_MS = 5000;
+const TIMEOUT_MS = 3000;
 
 interface PageviewResult {
     pageview: number;
@@ -59,22 +59,32 @@ export class PageviewService {
      */
     async fetchBulkPageviews(items: BulkPageviewItem[], date: string, concurrency: number = 3): Promise<Map<string, PageviewResult>> {
         const map = new Map<string, PageviewResult>();
+        const total = items.length;
+        const totalBatches = Math.ceil(total / concurrency);
+
+        console.log(`[PAGEVIEW] Buscando pageviews: ${total} itens em ${totalBatches} lotes de ${concurrency}`);
 
         for (let i = 0; i < items.length; i += concurrency) {
             const batch = items.slice(i, i + concurrency);
+            const batchNum = Math.floor(i / concurrency) + 1;
             const results = await Promise.allSettled(
                 batch.map(item => this.fetchPageviews(item.domain, item.postId, date))
             );
 
+            let batchOk = 0;
             for (let j = 0; j < batch.length; j++) {
                 const result = results[j];
                 if (result.status === 'fulfilled' && result.value) {
                     const key = `${batch[j].domain}_${batch[j].postId}`;
                     map.set(key, result.value);
+                    batchOk++;
                 }
             }
+
+            console.log(`[PAGEVIEW] Lote ${batchNum}/${totalBatches}: ${batchOk}/${batch.length} ok (${map.size}/${total} total)`);
         }
 
+        console.log(`[PAGEVIEW] Concluído: ${map.size}/${total} pageviews obtidos`);
         return map;
     }
 }

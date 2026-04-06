@@ -228,17 +228,28 @@ export class RedirectController {
             });
         }
 
-        // Ordenar por revenue desc antes de buscar pageviews (prioriza quem gera mais receita)
+        // Ordenar por revenue desc
         globalRanking.sort((a, b) => b.revenue - a.revenue);
 
-        // Buscar unique visitors sequencialmente (1 a 1) para calcular RPS
+        // Limitar a 10 itens por domínio (top 10 por receita de cada domínio)
+        const domainCounts = new Map<string, number>();
+        const limitedRanking = globalRanking.filter(item => {
+            const count = domainCounts.get(item.domain) || 0;
+            if (count >= 10) return false;
+            domainCounts.set(item.domain, count + 1);
+            return true;
+        });
+
+        console.log(`[CRON-${slug.toUpperCase()}] Ranking limitado: ${limitedRanking.length} itens (de ${globalRanking.length}, max 10 por domínio)`);
+
+        // Buscar unique visitors com throttle (3 simultâneas) para calcular RPS
         const todayStr = today.toISOString().split('T')[0];
         const pageviewMap = await this.pageviewService.fetchBulkPageviews(
-            globalRanking.map(item => ({ domain: item.domain, postId: item.postId })),
+            limitedRanking.map(item => ({ domain: item.domain, postId: item.postId })),
             todayStr
         );
 
-        for (const item of globalRanking) {
+        for (const item of limitedRanking) {
             const pv = pageviewMap.get(`${item.domain}_${item.postId}`);
             if (pv) {
                 item.uniqueVisitors = pv.unique;
@@ -249,7 +260,7 @@ export class RedirectController {
         }
 
         // Filtrar itens com menos de 10 unique visitors (RPS distorcido)
-        const filteredRanking = globalRanking.filter(item => item.uniqueVisitors >= 10);
+        const filteredRanking = limitedRanking.filter(item => item.uniqueVisitors >= 10);
 
         // Ordenar por RPS decrescente (ranking global)
         filteredRanking.sort((a, b) => b.rps - a.rps);
