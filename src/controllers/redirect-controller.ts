@@ -579,18 +579,18 @@ export class RedirectController {
     }
 
     /**
-     * Retorna a lista de domínios já visitados pelo IP nesta hora.
+     * Counter global por slug — cada request incrementa, independente de IP.
+     * Retorna o índice (0-based) para usar no ranking.
      */
-    private async getVisitorVisitCount(ip: string, type: string): Promise<number> {
+    private async getGlobalVisitIndex(slug: string): Promise<number> {
         if (!this.redisClient) return 0;
 
-        const key = this.getVisitorKey(ip, type);
+        const key = `redirect:global_counter:${slug}`;
         const count = await this.redisClient.incr(key);
-        // Setar TTL apenas na primeira visita (count === 1)
+        // TTL de 1 hora — reseta o counter a cada hora
         if (count === 1) {
             await this.redisClient.expire(key, 3600);
         }
-        // count=1 significa primeira visita (index 0), count=2 segunda (index 1), etc.
         return count - 1;
     }
 
@@ -996,8 +996,8 @@ export class RedirectController {
             // Verificar idioma
             const language = req.query.language as string;
 
-            // Contar visitas do visitante nesta hora (ranking global, sem dominio)
-            const visitIndex = await this.getVisitorVisitCount(clientIp, 'main');
+            // Counter global por slug — cada request vai pro próximo do ranking
+            const visitIndex = await this.getGlobalVisitIndex('main');
 
             // Buscar ranking global de links
             const globalRanking = await this.getBestLinksMap();
@@ -1159,8 +1159,8 @@ export class RedirectController {
             const clientIp = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ||
                            req.socket.remoteAddress || 'unknown';
 
-            // Contar visitas do visitante nesta hora
-            const visitIndex = await this.getVisitorVisitCount(clientIp, slug);
+            // Counter global por slug — cada request vai pro próximo do ranking
+            const visitIndex = await this.getGlobalVisitIndex(slug);
 
             // Buscar ranking global de links do grupo
             const globalRanking = await this.getBestLinksMapForGroup(slug);
