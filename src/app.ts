@@ -136,25 +136,35 @@ export async function createApp(): Promise<Express> {
         app.get('/db/:campaignId', (req, res) => redirectController.redirectByGroup(req, res, 'db'));
 
         // Rota dinâmica: verifica se o path é um slug ativo antes de tratar como campaignId
-        app.get('/:slugOrCampaign', async (req, res) => {
+        app.get('/:slugOrCampaign', (req, res) => {
             const param = req.params.slugOrCampaign;
-            const slugs = await domainGroupService.getActiveSlugs();
-            if (slugs.includes(param) && param !== 'main') {
-                return redirectController.redirectByGroup(req, res, param);
-            }
-            // Não é slug → trata como campaignId do main
-            return redirectController.redirect(req, res);
+            domainGroupService.getActiveSlugs()
+                .then(slugs => {
+                    if (slugs.includes(param) && param !== 'main') {
+                        return redirectController.redirectByGroup(req, res, param);
+                    }
+                    return redirectController.redirect(req, res);
+                })
+                .catch(err => {
+                    console.error('[ROUTE] Error resolving slug:', err);
+                    redirectController.redirect(req, res);
+                });
         });
 
         // Rota dinâmica com campaignId: /{slug}/{campaignId}
-        app.get('/:slugOrCampaign/:campaignId', async (req, res) => {
+        app.get('/:slugOrCampaign/:campaignId', (req, res) => {
             const param = req.params.slugOrCampaign;
-            const slugs = await domainGroupService.getActiveSlugs();
-            if (slugs.includes(param) && param !== 'main') {
-                return redirectController.redirectByGroup(req, res, param);
-            }
-            // Não é slug → trata como campaignId do main
-            return redirectController.redirect(req, res);
+            domainGroupService.getActiveSlugs()
+                .then(slugs => {
+                    if (slugs.includes(param) && param !== 'main') {
+                        return redirectController.redirectByGroup(req, res, param);
+                    }
+                    return redirectController.redirect(req, res);
+                })
+                .catch(err => {
+                    console.error('[ROUTE] Error resolving slug:', err);
+                    redirectController.redirect(req, res);
+                });
         });
     } else {
         // Rota de fallback se não houver DB
