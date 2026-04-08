@@ -108,10 +108,23 @@ export async function createApp(): Promise<Express> {
         // Montar rotas de CRUD de domain groups
         app.use('/api/domain-groups', createDomainGroupRouter(domainGroupService));
 
-        // Rotas com campaignId para /db
+        // Registrar rotas estáticas para slugs que existem no startup (rápido, sem lookup)
+        try {
+            const slugs = await domainGroupService.getActiveSlugs();
+            for (const slug of slugs) {
+                if (slug === 'main' || slug === 'db') continue;
+                console.log(`[ROUTES] Registering route /${slug}`);
+                app.get(`/${slug}`, (req, res) => redirectController.redirectByGroup(req, res, slug));
+                app.get(`/${slug}/:campaignId`, (req, res) => redirectController.redirectByGroup(req, res, slug));
+            }
+        } catch (error) {
+            console.error('[ROUTES] Error registering dynamic routes:', error);
+        }
+
+        // Rotas estáticas para /db com campaignId
         app.get('/db/:campaignId', (req, res) => redirectController.redirectByGroup(req, res, 'db'));
 
-        // Rota dinâmica: verifica se é slug ativo, senão trata como campaignId do main
+        // Catch-all: captura slugs criados após startup + campaignId do main
         app.get('/:param', (req, res) => {
             const param = req.params.param;
             domainGroupService.getActiveSlugs()
@@ -125,7 +138,6 @@ export async function createApp(): Promise<Express> {
                 .catch(() => redirectController.redirect(req, res));
         });
 
-        // Rota dinâmica com campaignId: /{slug}/{campaignId}
         app.get('/:param/:campaignId', (req, res) => {
             const param = req.params.param;
             domainGroupService.getActiveSlugs()

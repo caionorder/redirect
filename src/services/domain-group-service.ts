@@ -76,11 +76,11 @@ export class DomainGroupService {
     }
 
     /**
-     * Garante que o cache esta fresco
+     * Garante que o cache foi carregado (só na primeira vez).
+     * Depois só atualiza via refreshCache() chamado pelos métodos de mutação.
      */
     private async ensureCache(): Promise<void> {
-        const now = Date.now();
-        if (this.cacheTime === 0 || (now - this.cacheTime) > this.CACHE_TTL_MS) {
+        if (this.cacheTime === 0) {
             await this.refreshCache();
         }
     }
