@@ -132,37 +132,31 @@ export async function createApp(): Promise<Express> {
         // Montar rotas de CRUD de domain groups
         app.use('/api/domain-groups', createDomainGroupRouter(domainGroupService));
 
-        // Rotas com campaignId para /db
-        app.get('/db/:campaignId', (req, res) => redirectController.redirectByGroup(req, res, 'db'));
+        // Registrar rotas estáticas para slugs que já existem no startup
+        try {
+            const slugs = await domainGroupService.getActiveSlugs();
+            for (const slug of slugs) {
+                if (slug === 'main') continue;
+                console.log(`[ROUTES] Registering route /${slug}`);
+                app.get(`/${slug}`, (req, res) => redirectController.redirectByGroup(req, res, slug));
+                app.get(`/${slug}/:campaignId`, (req, res) => redirectController.redirectByGroup(req, res, slug));
+            }
+        } catch (error) {
+            console.error('[ROUTES] Error registering dynamic routes:', error);
+        }
 
-        // Rota dinâmica: verifica se o path é um slug ativo antes de tratar como campaignId
-        app.get('/:slugOrCampaign', (req, res) => {
-            const param = req.params.slugOrCampaign;
+        // Catch-all: verifica se é um slug novo (criado após startup) antes de tratar como campaignId
+        app.get('/:param', (req, res) => {
+            const param = req.params.param;
             domainGroupService.getActiveSlugs()
                 .then(slugs => {
                     if (slugs.includes(param) && param !== 'main') {
-                        return redirectController.redirectByGroup(req, res, param);
+                        redirectController.redirectByGroup(req, res, param);
+                    } else {
+                        redirectController.redirect(req, res);
                     }
-                    return redirectController.redirect(req, res);
                 })
-                .catch(err => {
-                    console.error('[ROUTE] Error resolving slug:', err);
-                    redirectController.redirect(req, res);
-                });
-        });
-
-        // Rota dinâmica com campaignId: /{slug}/{campaignId}
-        app.get('/:slugOrCampaign/:campaignId', (req, res) => {
-            const param = req.params.slugOrCampaign;
-            domainGroupService.getActiveSlugs()
-                .then(slugs => {
-                    if (slugs.includes(param) && param !== 'main') {
-                        return redirectController.redirectByGroup(req, res, param);
-                    }
-                    return redirectController.redirect(req, res);
-                })
-                .catch(err => {
-                    console.error('[ROUTE] Error resolving slug:', err);
+                .catch(() => {
                     redirectController.redirect(req, res);
                 });
         });
