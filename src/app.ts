@@ -132,12 +132,12 @@ export async function createApp(): Promise<Express> {
         // Montar rotas de CRUD de domain groups
         app.use('/api/domain-groups', createDomainGroupRouter(domainGroupService));
 
-        // Registrar rotas estáticas para slugs que já existem no startup
+        // Registrar rotas dinamicas para grupos alem de "main" e "db"
         try {
             const slugs = await domainGroupService.getActiveSlugs();
             for (const slug of slugs) {
-                if (slug === 'main') continue;
-                console.log(`[ROUTES] Registering route /${slug}`);
+                if (slug === 'main' || slug === 'db') continue;
+                console.log(`[ROUTES] Registering dynamic route /${slug}`);
                 app.get(`/${slug}`, (req, res) => redirectController.redirectByGroup(req, res, slug));
                 app.get(`/${slug}/:campaignId`, (req, res) => redirectController.redirectByGroup(req, res, slug));
             }
@@ -145,21 +145,9 @@ export async function createApp(): Promise<Express> {
             console.error('[ROUTES] Error registering dynamic routes:', error);
         }
 
-        // Catch-all: verifica se é um slug novo (criado após startup) antes de tratar como campaignId
-        app.get('/:param', (req, res) => {
-            const param = req.params.param;
-            domainGroupService.getActiveSlugs()
-                .then(slugs => {
-                    if (slugs.includes(param) && param !== 'main') {
-                        redirectController.redirectByGroup(req, res, param);
-                    } else {
-                        redirectController.redirect(req, res);
-                    }
-                })
-                .catch(() => {
-                    redirectController.redirect(req, res);
-                });
-        });
+        // Rotas com campaignId no path (ex: /120242094780560734 ou /db/120242094780560734)
+        app.get('/db/:campaignId', (req, res) => redirectController.redirectByGroup(req, res, 'db'));
+        app.get('/:campaignId', (req, res) => redirectController.redirect(req, res));
     } else {
         // Rota de fallback se não houver DB
         app.use('/api', (_req, res) => {
