@@ -132,22 +132,30 @@ export async function createApp(): Promise<Express> {
         // Montar rotas de CRUD de domain groups
         app.use('/api/domain-groups', createDomainGroupRouter(domainGroupService));
 
-        // Registrar rotas dinamicas para grupos alem de "main" e "db"
-        try {
-            const slugs = await domainGroupService.getActiveSlugs();
-            for (const slug of slugs) {
-                if (slug === 'main' || slug === 'db') continue;
-                console.log(`[ROUTES] Registering dynamic route /${slug}`);
-                app.get(`/${slug}`, (req, res) => redirectController.redirectByGroup(req, res, slug));
-                app.get(`/${slug}/:campaignId`, (req, res) => redirectController.redirectByGroup(req, res, slug));
-            }
-        } catch (error) {
-            console.error('[ROUTES] Error registering dynamic routes:', error);
-        }
-
-        // Rotas com campaignId no path (ex: /120242094780560734 ou /db/120242094780560734)
+        // Rotas com campaignId para /db
         app.get('/db/:campaignId', (req, res) => redirectController.redirectByGroup(req, res, 'db'));
-        app.get('/:campaignId', (req, res) => redirectController.redirect(req, res));
+
+        // Rota dinâmica: verifica se o path é um slug ativo antes de tratar como campaignId
+        app.get('/:slugOrCampaign', async (req, res) => {
+            const param = req.params.slugOrCampaign;
+            const slugs = await domainGroupService.getActiveSlugs();
+            if (slugs.includes(param) && param !== 'main') {
+                return redirectController.redirectByGroup(req, res, param);
+            }
+            // Não é slug → trata como campaignId do main
+            return redirectController.redirect(req, res);
+        });
+
+        // Rota dinâmica com campaignId: /{slug}/{campaignId}
+        app.get('/:slugOrCampaign/:campaignId', async (req, res) => {
+            const param = req.params.slugOrCampaign;
+            const slugs = await domainGroupService.getActiveSlugs();
+            if (slugs.includes(param) && param !== 'main') {
+                return redirectController.redirectByGroup(req, res, param);
+            }
+            // Não é slug → trata como campaignId do main
+            return redirectController.redirect(req, res);
+        });
     } else {
         // Rota de fallback se não houver DB
         app.use('/api', (_req, res) => {
