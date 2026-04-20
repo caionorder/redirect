@@ -6,6 +6,7 @@ import { domains as seedDomains, domains_db as seedDomainsDb } from '../config/d
 export class DomainGroupService {
     private repository: DomainGroupRepository;
     private cache: Map<string, string[]> = new Map();
+    private groupConfigCache: Map<string, IDomainGroup> = new Map();
     private allGroupsCache: IDomainGroup[] = [];
     private cacheTime: number = 0;
     private readonly CACHE_TTL_MS = 60000; // 1 minuto
@@ -65,8 +66,10 @@ export class DomainGroupService {
         try {
             const groups = await this.repository.findActiveGroups();
             this.cache.clear();
+            this.groupConfigCache.clear();
             for (const group of groups) {
                 this.cache.set(group.slug, group.domains);
+                this.groupConfigCache.set(group.slug, group);
             }
             this.allGroupsCache = await this.repository.findAll();
             this.cacheTime = Date.now();
@@ -83,6 +86,14 @@ export class DomainGroupService {
         if (this.cacheTime === 0) {
             await this.refreshCache();
         }
+    }
+
+    /**
+     * Retorna a config completa de um grupo pelo slug (usa cache).
+     */
+    async getGroupConfig(slug: string): Promise<IDomainGroup | null> {
+        await this.ensureCache();
+        return this.groupConfigCache.get(slug) || null;
     }
 
     /**
@@ -140,7 +151,7 @@ export class DomainGroupService {
     /**
      * Deleta um grupo pelo slug
      */
-    async updateGroup(slug: string, update: { slug?: string; name?: string }): Promise<IDomainGroup | null> {
+    async updateGroup(slug: string, update: { slug?: string; name?: string; bestRpsMode?: boolean }): Promise<IDomainGroup | null> {
         const group = await this.repository.updateBySlug(slug, update);
         if (group) {
             await this.refreshCache();

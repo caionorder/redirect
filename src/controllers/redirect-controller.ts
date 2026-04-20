@@ -611,6 +611,66 @@ export class RedirectController {
     }
 
     /**
+     * Best RPS mode: finds the highest-RPS link whose domain the user hasn't visited this hour.
+     * Falls back to random if all domains are exhausted.
+     */
+    private async getBestRpsLink(
+        clientIp: string,
+        slug: string,
+        ranking: RankedLinksList,
+        groupDomains: string[]
+    ): Promise<{ url: string; domain: string; linkId: string; logType: string }> {
+        const visitorKey = this.getVisitorKey(clientIp, slug);
+
+        // Get visited domains for this IP + slug + hour
+        let visitedDomains: Set<string> = new Set();
+        if (this.redisClient) {
+            try {
+                const members = await this.redisClient.smembers(visitorKey);
+                visitedDomains = new Set(members);
+            } catch (error) {
+                console.error(`[BEST_RPS] Error reading visited domains:`, error);
+            }
+        }
+
+        // Iterate ranking (already sorted by RPS descending) — find first unvisited domain
+        for (let i = 0; i < ranking.length; i++) {
+            const link = ranking[i];
+            if (!visitedDomains.has(link.domain)) {
+                // Mark domain as visited
+                if (this.redisClient) {
+                    try {
+                        const added = await this.redisClient.sadd(visitorKey, link.domain);
+                        if (added === 1) {
+                            const ttl = await this.redisClient.ttl(visitorKey);
+                            if (ttl === -1) {
+                                await this.redisClient.expire(visitorKey, 3600);
+                            }
+                        }
+                    } catch (error) {
+                        console.error(`[BEST_RPS] Error marking visited domain:`, error);
+                    }
+                }
+                return {
+                    url: link.url,
+                    domain: link.domain,
+                    linkId: `bestrps_${slug}_${link.domain}_${link.postId}`,
+                    logType: `BEST_RPS #${i + 1} ${slug.toUpperCase()}`
+                };
+            }
+        }
+
+        // All domains exhausted — pick random domain with /random path
+        const randomDomain = groupDomains[Math.floor(Math.random() * groupDomains.length)];
+        return {
+            url: `https://${randomDomain}${generateRandomPath()}`,
+            domain: randomDomain,
+            linkId: `bestrps_exhausted_${slug}_${randomDomain}`,
+            logType: `BEST_RPS EXHAUSTED ${slug.toUpperCase()}`
+        };
+    }
+
+    /**
      * Obtem o ranking de melhores links de um grupo pelo slug (com cache em memória + Redis)
      */
     private async getBestLinksMapForGroup(slug: string): Promise<RankedLinksList | null> {
@@ -996,9 +1056,6 @@ export class RedirectController {
             // Verificar idioma
             const language = req.query.language as string;
 
-            // Counter global por slug — cada request vai pro próximo do ranking
-            const visitIndex = await this.getGlobalVisitIndex('main');
-
             // Buscar ranking global de links
             const globalRanking = await this.getBestLinksMap();
 
@@ -1008,13 +1065,26 @@ export class RedirectController {
             let domain: string;
 
             if (globalRanking && globalRanking.length > 0) {
-                // Esgotou o ranking -> volta pro primeiro (ciclo)
-                const idx = visitIndex % globalRanking.length;
-                const linkInfo = globalRanking[idx];
-                redirectUrl = linkInfo.url;
-                domain = linkInfo.domain;
-                linkId = `rank${idx}_${domain}_${linkInfo.postId}`;
-                logType = `RANK #${idx + 1}`;
+                // Check if bestRpsMode is enabled for 'main'
+                const mainConfig = await this.domainGroupService.getGroupConfig('main');
+                if (mainConfig?.bestRpsMode) {
+                    const mainDomains = await this.domainGroupService.getDomains('main');
+                    const bestRps = await this.getBestRpsLink(clientIp, 'main', globalRanking, mainDomains);
+                    redirectUrl = bestRps.url;
+                    domain = bestRps.domain;
+                    linkId = bestRps.linkId;
+                    logType = bestRps.logType;
+                } else {
+                    // Counter global por slug — cada request vai pro próximo do ranking
+                    const visitIndex = await this.getGlobalVisitIndex('main');
+                    // Esgotou o ranking -> volta pro primeiro (ciclo)
+                    const idx = visitIndex % globalRanking.length;
+                    const linkInfo = globalRanking[idx];
+                    redirectUrl = linkInfo.url;
+                    domain = linkInfo.domain;
+                    linkId = `rank${idx}_${domain}_${linkInfo.postId}`;
+                    logType = `RANK #${idx + 1}`;
+                }
             } else {
                 // Sem dados de ranking -> dominio aleatorio + /random
                 const mainDomains = await this.domainGroupService.getDomains('main');
@@ -1044,8 +1114,7 @@ export class RedirectController {
 
             // Log com informacao de idioma e dominio
             const langInfo = isInvertedDomain ? (language ? ` [${language.toUpperCase()}]` : ' [EN]') : '';
-            const visitInfo = ` (visita #${visitIndex + 1})`;
-            console.log(`[${logType}]${langInfo} ${domain}${visitInfo} -> ${redirectUrl}`);
+            console.log(`[${logType}]${langInfo} ${domain} -> ${redirectUrl}`);
 
             // Repassa TODOS os query params recebidos, com defaults para UTMs
             const allParams = new URLSearchParams();
@@ -1143,9 +1212,6 @@ export class RedirectController {
             const clientIp = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ||
                            req.socket.remoteAddress || 'unknown';
 
-            // Counter global por slug — cada request vai pro próximo do ranking
-            const visitIndex = await this.getGlobalVisitIndex(slug);
-
             // Buscar ranking global de links do grupo
             const globalRanking = await this.getBestLinksMapForGroup(slug);
 
@@ -1155,13 +1221,25 @@ export class RedirectController {
             let domain: string;
 
             if (globalRanking && globalRanking.length > 0) {
-                // Esgotou o ranking -> volta pro primeiro (ciclo)
-                const idx = visitIndex % globalRanking.length;
-                const linkInfo = globalRanking[idx];
-                redirectUrl = linkInfo.url;
-                domain = linkInfo.domain;
-                linkId = `rank${idx}_${slug}_${domain}_${linkInfo.postId}`;
-                logType = `RANK #${idx + 1} ${slug.toUpperCase()}`;
+                // Check if bestRpsMode is enabled for this slug
+                const groupConfig = await this.domainGroupService.getGroupConfig(slug);
+                if (groupConfig?.bestRpsMode) {
+                    const bestRps = await this.getBestRpsLink(clientIp, slug, globalRanking, groupDomains);
+                    redirectUrl = bestRps.url;
+                    domain = bestRps.domain;
+                    linkId = bestRps.linkId;
+                    logType = bestRps.logType;
+                } else {
+                    // Counter global por slug — cada request vai pro próximo do ranking
+                    const visitIndex = await this.getGlobalVisitIndex(slug);
+                    // Esgotou o ranking -> volta pro primeiro (ciclo)
+                    const idx = visitIndex % globalRanking.length;
+                    const linkInfo = globalRanking[idx];
+                    redirectUrl = linkInfo.url;
+                    domain = linkInfo.domain;
+                    linkId = `rank${idx}_${slug}_${domain}_${linkInfo.postId}`;
+                    logType = `RANK #${idx + 1} ${slug.toUpperCase()}`;
+                }
             } else {
                 // Sem dados de ranking -> dominio aleatorio + /random
                 domain = groupDomains[Math.floor(Math.random() * groupDomains.length)];
@@ -1172,8 +1250,7 @@ export class RedirectController {
             }
 
             // Log
-            const visitInfo = ` (visita #${visitIndex + 1})`;
-            console.log(`[${logType}] ${domain}${visitInfo} -> ${redirectUrl}`);
+            console.log(`[${logType}] ${domain} -> ${redirectUrl}`);
 
             // Repassa TODOS os query params recebidos, com defaults para UTMs
             const allParams = new URLSearchParams();

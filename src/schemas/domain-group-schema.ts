@@ -4,6 +4,7 @@ export interface IDomainGroup {
     name: string;
     domains: string[];
     active: boolean;
+    bestRpsMode?: boolean;
     createdAt: Date;
     updatedAt: Date;
 }

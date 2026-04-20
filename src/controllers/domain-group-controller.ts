@@ -60,10 +60,10 @@ export class DomainGroupController {
     async update(req: Request, res: Response): Promise<void> {
         try {
             const currentSlug = req.params.slug as string;
-            const { slug: newSlug, name } = req.body;
+            const { slug: newSlug, name, bestRpsMode } = req.body;
 
-            if (!newSlug && !name) {
-                res.status(400).json({ error: 'At least one of slug or name is required' });
+            if (!newSlug && !name && typeof bestRpsMode !== 'boolean') {
+                res.status(400).json({ error: 'At least one of slug, name, or bestRpsMode is required' });
                 return;
             }
 
@@ -72,7 +72,7 @@ export class DomainGroupController {
                 return;
             }
 
-            const group = await this.service.updateGroup(currentSlug, { slug: newSlug, name });
+            const group = await this.service.updateGroup(currentSlug, { slug: newSlug, name, bestRpsMode });
             if (!group) {
                 res.status(404).json({ error: 'Group not found' });
                 return;

@@ -36,6 +36,7 @@ export class DomainGroupRepository {
             name: data.name,
             domains: data.domains || [],
             active: true,
+            bestRpsMode: false,
             createdAt: now,
             updatedAt: now,
         };
@@ -44,10 +45,11 @@ export class DomainGroupRepository {
         return { ...document, _id: result.insertedId };
     }
 
-    async updateBySlug(slug: string, update: { slug?: string; name?: string }): Promise<IDomainGroup | null> {
+    async updateBySlug(slug: string, update: { slug?: string; name?: string; bestRpsMode?: boolean }): Promise<IDomainGroup | null> {
         const setFields: Record<string, unknown> = { updatedAt: new Date() };
         if (update.name) setFields.name = update.name;
         if (update.slug) setFields.slug = update.slug;
+        if (typeof update.bestRpsMode === 'boolean') setFields.bestRpsMode = update.bestRpsMode;
 
         const result = await this.collection.findOneAndUpdate(
             { slug },
