@@ -178,12 +178,16 @@ export class RedirectController {
             return null;
         }
 
-        const date = new Date();
-        const today = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+        // Data de hoje no fuso America/Sao_Paulo — bate com o `date` gravado pelo ETL.
+        // Sem isso, em servidor UTC, das 21h-00h BRT a query erra o dia.
+        const todayStr = new Intl.DateTimeFormat('en-CA', {
+            timeZone: 'America/Sao_Paulo',
+            year: 'numeric', month: '2-digit', day: '2-digit'
+        }).format(new Date());
 
         const filterRequest: IFilterRequest = {
-            start: today.toISOString().split('T')[0],
-            end: today.toISOString().split('T')[0],
+            start: todayStr,
+            end: todayStr,
             domain: groupDomains,
             custom_key: "id_post_wp",
             group: ["domain", "custom_key", "custom_value"]
@@ -243,7 +247,6 @@ export class RedirectController {
         console.log(`[CRON-${slug.toUpperCase()}] Ranking limitado: ${limitedRanking.length} itens (de ${globalRanking.length}, max 10 por domínio)`);
 
         // Buscar unique visitors com throttle (3 simultâneas) para calcular RPS
-        const todayStr = today.toISOString().split('T')[0];
         const pageviewMap = await this.pageviewService.fetchBulkPageviews(
             limitedRanking.map(item => ({ domain: item.domain, postId: item.postId })),
             todayStr
