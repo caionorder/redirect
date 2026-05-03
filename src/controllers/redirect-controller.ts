@@ -242,9 +242,6 @@ export class RedirectController {
 
         console.log(`[CRON-${slug.toUpperCase()}] Ranking limitado: ${limitedRanking.length} itens (de ${globalRanking.length}, max 10 por domínio)`);
 
-        // FIX TEMPORÁRIO: pageview.joinads.me fora do ar — ranking por eCPM ao invés de RPS.
-        // Restaurar o bloco abaixo quando o serviço de pageview voltar.
-        /*
         // Buscar unique visitors com throttle (3 simultâneas) para calcular RPS
         const todayStr = today.toISOString().split('T')[0];
         const pageviewMap = await this.pageviewService.fetchBulkPageviews(
@@ -267,17 +264,13 @@ export class RedirectController {
 
         // Ordenar por RPS decrescente (ranking global)
         filteredRanking.sort((a, b) => b.rps - a.rps);
-        */
-
-        // Fallback: ordenar por eCPM decrescente (sem dados de pageview)
-        const filteredRanking = [...limitedRanking].sort((a, b) => b.ecpm - a.ecpm);
 
         // Validar posts via API WordPress ANTES de intercalar (senão /random seria removido)
         const validatedRanking = await this.validateRanking(filteredRanking);
 
         // Se não sobrou nenhum post real, manter o cache anterior
         if (validatedRanking.length === 0) {
-            console.log(`[CRON-${slug.toUpperCase()}] Nenhum post com eCPM válido — mantendo cache anterior`);
+            console.log(`[CRON-${slug.toUpperCase()}] Nenhum post com RPS válido — mantendo cache anterior`);
             return null;
         }
 
