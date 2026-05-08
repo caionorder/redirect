@@ -80,14 +80,24 @@ export class DomainGroupService {
         }
     }
 
+    private refreshPromise: Promise<void> | null = null;
+
     /**
-     * Garante que o cache foi carregado (só na primeira vez).
-     * Depois só atualiza via refreshCache() chamado pelos métodos de mutação.
+     * Garante que o cache foi carregado e está dentro do TTL.
+     * Sob alta concorrência, requests simultâneas convergem na mesma promise
+     * (single-flight) — evita thundering herd no Mongo quando o cache expira.
      */
     private async ensureCache(): Promise<void> {
-        if (this.cacheTime === 0) {
-            await this.refreshCache();
+        const isExpired = this.cacheTime === 0 || Date.now() - this.cacheTime > this.CACHE_TTL_MS;
+        if (!isExpired) return;
+        if (this.refreshPromise) {
+            await this.refreshPromise;
+            return;
         }
+        this.refreshPromise = this.refreshCache().finally(() => {
+            this.refreshPromise = null;
+        });
+        await this.refreshPromise;
     }
 
     /**
