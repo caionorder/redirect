@@ -1,10 +1,8 @@
 import { Router } from 'express';
 import { RedirectController } from '../controllers/redirect-controller';
-import { Db } from 'mongodb';
 
-export function createRedirectRouter(db?: Db): Router {
+export function createRedirectRouter(controller: RedirectController): Router {
   const router = Router();
-  const controller = new RedirectController(db);
 
   // Rota de redirecionamento com tracking
   router.get('/redirect', (req, res) =>

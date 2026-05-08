@@ -1,4 +1,4 @@
-import { Db, Collection, ObjectId } from 'mongodb';
+import { Db, Collection, ObjectId, AnyBulkWriteOperation } from 'mongodb';
 import {
     IRedirectClick,
     ICreateRedirectClick,
@@ -204,27 +204,24 @@ export class RedirectClickRepository {
     }
 
     /**
-     * Incrementa clicks em lote para múltiplos links
+     * Incrementa clicks em lote para múltiplos links (1 round-trip via bulkWrite).
      */
     async incrementMultipleClicks(linkIds: string[]): Promise<number> {
-        let incrementedCount = 0;
+        if (linkIds.length === 0) return 0;
 
-        for (const linkId of linkIds) {
-            const result = await this.collection.updateOne(
-                { link_id: linkId },
-                {
+        const operations: AnyBulkWriteOperation<IRedirectClick>[] = linkIds.map(linkId => ({
+            updateOne: {
+                filter: { link_id: linkId },
+                update: {
                     $inc: { count: 1 },
                     $setOnInsert: { created_at: new Date() }
                 },
-                { upsert: true }
-            );
-
-            if (result.modifiedCount === 1 || result.upsertedCount === 1) {
-                incrementedCount++;
+                upsert: true
             }
-        }
+        }));
 
-        return incrementedCount;
+        const result = await this.collection.bulkWrite(operations, { ordered: false });
+        return (result.modifiedCount || 0) + (result.upsertedCount || 0);
     }
 
     /**

@@ -8,9 +8,11 @@
     "express-rate-limit": "^7.4.1",
     "helmet": "^8.0.0",
     "ioredis": "^5.4.1",
+    "js-yaml": "^4.1.1",
     "mongodb": "^6.10.0",
     "morgan": "^1.10.0",
-    "node-cron": "^4.2.1"
+    "node-cron": "^4.2.1",
+    "swagger-ui-express": "^5.0.1"
   },
   "name": "redirect",
   "version": "1.0.0",
@@ -30,8 +32,10 @@
     "@types/compression": "^1.7.5",
     "@types/cors": "^2.8.17",
     "@types/express": "^5.0.5",
+    "@types/js-yaml": "^4.0.9",
     "@types/morgan": "^1.9.9",
     "@types/node": "^24.10.1",
+    "@types/swagger-ui-express": "^4.1.8",
     "tsx": "^4.7.0",
     "typescript": "^5.3.3"
   }

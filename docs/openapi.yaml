@@ -1,0 +1,1234 @@
+openapi: 3.0.3
+info:
+  title: Redirect Service API
+  description: |
+    Servico de redirecionamento HTTP latency-critical com tracking de clicks e regras condicionais.
+
+    ## Visao geral
+    - **Hot path**: `GET /`, `GET /db`, `GET /:slug` retornam 302 navegacional para o melhor link disponivel (ranking eCPM/RPS).
+    - **API administrativa**: `/api/*` para gerenciar grupos de dominio, links, rules e in-app rules.
+    - **Health**: `/health`, `/health/detailed`, `/health/ready`, `/ping` (Kubernetes-friendly).
+
+    ## Conceitos
+    - **Domain group**: agrupamento logico de dominios (ex: `main`, `db`, ou slugs custom). Cada grupo tem ranking eCPM proprio (recalculado a cada 15 min via cron).
+    - **Rule**: regra condicional que faz match em query params (ex: `utm_source=facebook&country=BR`) e redireciona para uma URL fixa.
+    - **In-app rule**: regra baseada em `utm_campaign`. Se o user-agent for navegador in-app (Facebook/Instagram), redireciona; caso contrario, devolve HTML com iframe fullscreen para o destino.
+    - **Broad clicks**: contador agregado por `broad` query param + data (YYYY-MM-DD).
+  version: 1.0.0
+  contact:
+    name: Caio Norder
+    email: caio@joinads.me
+servers:
+  - url: https://redirect.belnk.in
+    description: Producao
+  - url: http://localhost:3000
+    description: Local dev
+tags:
+  - name: redirect
+    description: Hot path - redirecionamento navegacional 302
+  - name: domain-groups
+    description: Grupos de dominio (multi-tenant routing)
+  - name: rules
+    description: Regras de redirecionamento condicional baseadas em query params
+  - name: inapp-rules
+    description: Regras de in-app browser (utm_campaign matching, iframe fallback)
+  - name: analytics
+    description: Stats, ranking, links e clicks agregados
+  - name: health
+    description: Liveness, readiness, ping
+  - name: admin
+    description: Operacoes administrativas internas (process trigger, distinct values)
+
+paths:
+
+  # ========================================================================
+  # HOT PATH
+  # ========================================================================
+
+  /:
+    get:
+      tags: [redirect]
+      summary: Redirect principal (grupo `main`)
+      description: |
+        Hot path do servico. Aplica nesta ordem:
+
+        1. Match em `Rules` (query params).
+        2. Match em `InAppRules` por `utm_campaign` (redirect ou iframe HTML conforme user-agent).
+        3. Roteamento por ranking eCPM/RPS do grupo `main` (round-robin global ou best-RPS por IP, conforme `bestRpsMode`).
+        4. Fallback: dominio aleatorio + path random.
+
+        Sempre repassa todos os query params recebidos para o destino. Defaults UTM (`utm_source=redron`, `utm_medium=broadcast`) sao injetados quando ausentes. Se `?broad=` presente, usa como `utm_campaign` E incrementa `broad_clicks`. Click agregado e gravado no Mongo (fire-and-forget).
+
+        `favicon.ico` retorna 204 (no content) sem processar.
+      parameters:
+        - $ref: '#/components/parameters/UtmCampaign'
+        - $ref: '#/components/parameters/UtmSource'
+        - $ref: '#/components/parameters/UtmMedium'
+        - $ref: '#/components/parameters/Broad'
+        - $ref: '#/components/parameters/Language'
+      responses:
+        '200':
+          description: HTML com iframe fullscreen (apenas quando bate InApp rule e UA NAO e in-app browser)
+          content:
+            text/html:
+              schema:
+                type: string
+              example: '<!DOCTYPE html><html>...<iframe src="..."/></html>'
+        '204':
+          description: Favicon - resposta vazia
+        '302':
+          description: Redirect para o destino calculado
+          headers:
+            Location:
+              schema:
+                type: string
+                format: uri
+              description: URL do destino com query params propagados
+        '503':
+          description: DB nao conectado (modo fallback)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /db:
+    get:
+      tags: [redirect]
+      summary: Redirect para o grupo `db`
+      description: Mesma logica de `/` mas usa o ranking do grupo `db` em vez de `main`.
+      parameters:
+        - $ref: '#/components/parameters/UtmCampaign'
+        - $ref: '#/components/parameters/UtmSource'
+        - $ref: '#/components/parameters/UtmMedium'
+        - $ref: '#/components/parameters/Broad'
+      responses:
+        '200':
+          description: HTML com iframe (InApp rule + nao-in-app UA)
+          content:
+            text/html:
+              schema:
+                type: string
+        '204':
+          description: Favicon
+        '302':
+          description: Redirect para o destino
+        '503':
+          description: Grupo `db` sem dominios configurados
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /db/{campaignId}:
+    get:
+      tags: [redirect]
+      summary: Redirect grupo `db` com campaignId no path
+      description: Alias de `/db?utm_campaign={campaignId}`. O `campaignId` do path e usado como `utm_campaign` para match em `InAppRules`.
+      parameters:
+        - name: campaignId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Equivalente a `utm_campaign`
+      responses:
+        '200':
+          description: HTML com iframe
+          content:
+            text/html:
+              schema:
+                type: string
+        '302':
+          description: Redirect
+
+  /{slug}:
+    get:
+      tags: [redirect]
+      summary: Redirect por slug de grupo (rota dinamica)
+      description: |
+        Slugs ativos no startup recebem rota estatica. Slugs criados apos startup caem no catch-all que olha `getActiveSlugs()` e despacha para `redirectByGroup` ou cai no `redirect` principal (`main`).
+
+        Se `slug` nao for um grupo ativo, executa o redirect principal (grupo `main`).
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[a-z0-9-]+$'
+          description: Slug do grupo de dominio
+      responses:
+        '200':
+          description: HTML com iframe
+          content:
+            text/html:
+              schema:
+                type: string
+        '302':
+          description: Redirect para o destino
+        '503':
+          description: Grupo sem dominios configurados
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /{slug}/{campaignId}:
+    get:
+      tags: [redirect]
+      summary: Redirect por slug + campaignId
+      description: Combina slug do grupo com `campaignId` (usado como `utm_campaign`).
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: campaignId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: HTML com iframe
+          content:
+            text/html:
+              schema:
+                type: string
+        '302':
+          description: Redirect
+
+  # ========================================================================
+  # HEALTH
+  # ========================================================================
+
+  /health:
+    get:
+      tags: [health]
+      summary: Health check basico
+      description: Sempre 200. Confirma que o processo Express esta vivo e respondendo.
+      responses:
+        '200':
+          description: Saudavel
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthBasic'
+
+  /health/detailed:
+    get:
+      tags: [health]
+      summary: Health check com dependencias
+      description: Verifica MongoDB (admin ping) e Redis (PING). Retorna 503 se qualquer dependencia falhar.
+      responses:
+        '200':
+          description: Todas as dependencias OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthDetailed'
+        '503':
+          description: Dependencia degradada
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthDetailed'
+
+  /health/ready:
+    get:
+      tags: [health]
+      summary: Readiness probe (Kubernetes)
+      description: 200 se Mongo + Redis estao prontos. 503 caso contrario. Use no `readinessProbe` do K8s.
+      responses:
+        '200':
+          description: Pronto para receber trafego
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ready: { type: boolean, example: true }
+        '503':
+          description: Nao pronto
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ready: { type: boolean, example: false }
+
+  /ping:
+    get:
+      tags: [health]
+      summary: Ping
+      description: Retorna `pong` em texto simples. Mais leve que `/health`.
+      responses:
+        '200':
+          description: pong
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: pong
+
+  # ========================================================================
+  # DOMAIN GROUPS
+  # ========================================================================
+
+  /api/domain-groups:
+    get:
+      tags: [domain-groups]
+      summary: Listar todos os grupos de dominio
+      responses:
+        '200':
+          description: Lista de grupos
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  groups:
+                    type: array
+                    items: { $ref: '#/components/schemas/DomainGroup' }
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    post:
+      tags: [domain-groups]
+      summary: Criar grupo de dominio
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [slug, name]
+              properties:
+                slug:
+                  type: string
+                  pattern: '^[a-z0-9-]+$'
+                  description: Identificador (lowercase, numeros, hifens)
+                  example: campaign-summer
+                name:
+                  type: string
+                  example: Campaign Summer 2026
+                domains:
+                  type: array
+                  items: { type: string, format: hostname }
+                  example: ['site1.com', 'site2.com']
+            examples:
+              minimal:
+                value:
+                  slug: campaign-summer
+                  name: Campaign Summer 2026
+              with-domains:
+                value:
+                  slug: news
+                  name: News Network
+                  domains: ['noticia.com', 'jornal.net']
+      responses:
+        '201':
+          description: Grupo criado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  group: { $ref: '#/components/schemas/DomainGroup' }
+        '400':
+          description: slug ou name ausente, ou slug invalido
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: Slug ja existe
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/domain-groups/{slug}:
+    put:
+      tags: [domain-groups]
+      summary: Atualizar grupo (slug, name, bestRpsMode)
+      parameters:
+        - $ref: '#/components/parameters/GroupSlug'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Pelo menos um campo deve ser informado
+              properties:
+                slug:
+                  type: string
+                  pattern: '^[a-z0-9-]+$'
+                  description: Novo slug (renomeia o grupo)
+                name: { type: string }
+                bestRpsMode:
+                  type: boolean
+                  description: |
+                    Se true, ativa modo best-RPS (busca o link de melhor RPS cujo dominio o IP ainda nao visitou nesta hora).
+                    Se false, usa round-robin global por counter Redis.
+            examples:
+              rename:
+                value: { slug: novo-slug, name: Novo Nome }
+              toggle-mode:
+                value: { bestRpsMode: true }
+      responses:
+        '200':
+          description: Grupo atualizado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  group: { $ref: '#/components/schemas/DomainGroup' }
+        '400':
+          description: Nenhum campo informado ou slug invalido
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Conflito - novo slug ja existe
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    delete:
+      tags: [domain-groups]
+      summary: Deletar grupo
+      description: O grupo `main` nao pode ser deletado (HTTP 403).
+      parameters:
+        - $ref: '#/components/parameters/GroupSlug'
+      responses:
+        '200':
+          description: Deletado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string, example: "Group 'campaign-summer' deleted" }
+        '403':
+          description: Tentativa de deletar grupo `main`
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/domain-groups/{slug}/domains:
+    post:
+      tags: [domain-groups]
+      summary: Adicionar dominios ao grupo
+      parameters:
+        - $ref: '#/components/parameters/GroupSlug'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [domains]
+              properties:
+                domains:
+                  type: array
+                  minItems: 1
+                  items: { type: string, format: hostname }
+                  example: ['novosite.com', 'outro.net']
+      responses:
+        '200':
+          description: Dominios adicionados
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  group: { $ref: '#/components/schemas/DomainGroup' }
+        '400':
+          description: domains nao e array nao-vazio
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    delete:
+      tags: [domain-groups]
+      summary: Remover dominios do grupo
+      parameters:
+        - $ref: '#/components/parameters/GroupSlug'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [domains]
+              properties:
+                domains:
+                  type: array
+                  minItems: 1
+                  items: { type: string, format: hostname }
+      responses:
+        '200':
+          description: Dominios removidos
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  group: { $ref: '#/components/schemas/DomainGroup' }
+        '400':
+          description: domains invalido
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ========================================================================
+  # API/REDIRECT (controller)
+  # ========================================================================
+
+  /api/redirect:
+    get:
+      tags: [redirect]
+      summary: Redirect via API (mesma logica do `/`)
+      description: Endpoint funcional equivalente a `GET /`, exposto sob `/api` para uso programatico ou rotas com middleware completo (helmet/cors/json/morgan). Retorna 302.
+      parameters:
+        - $ref: '#/components/parameters/UtmCampaign'
+        - $ref: '#/components/parameters/UtmSource'
+        - $ref: '#/components/parameters/UtmMedium'
+        - $ref: '#/components/parameters/Broad'
+        - $ref: '#/components/parameters/Language'
+      responses:
+        '200':
+          description: HTML iframe (InApp rule, nao-in-app UA)
+          content:
+            text/html:
+              schema:
+                type: string
+        '302':
+          description: Redirect para destino
+
+  /api/process:
+    get:
+      tags: [admin]
+      summary: Disparar manualmente o calculo de ranking eCPM/RPS
+      description: |
+        Sem `slug`, executa para todos os grupos ativos e retorna todos os rankings.
+        Com `?slug=main`, executa apenas o grupo solicitado.
+
+        Mesmo trabalho que o cron de 15 min: busca dados do GAM, calcula RPS via pageviews, valida posts via WP REST, intercala por dominio, salva no Redis (TTL 1h).
+
+        **Caro**: faz fetch ao GAM ad units + pageviews API + WP REST. Use com parcimonia.
+      parameters:
+        - name: slug
+          in: query
+          required: false
+          schema: { type: string }
+          description: Se omitido, executa todos os grupos ativos
+      responses:
+        '200':
+          description: Ranking computado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  message: { type: string }
+                  slug: { type: string }
+                  data:
+                    description: Ranking unico (com slug) ou map { slug -> ranking } (sem slug)
+                    oneOf:
+                      - type: array
+                        items: { $ref: '#/components/schemas/RankedLink' }
+                      - type: object
+                        additionalProperties:
+                          type: array
+                          items: { $ref: '#/components/schemas/RankedLink' }
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/stats:
+    get:
+      tags: [analytics]
+      summary: Estatisticas agregadas (GAM + clicks + ranking atual)
+      description: |
+        Retorna agregacao multi-fonte:
+        - `gam`: stats do GAM ad units (impressoes, clicks, revenue, eCPM medio, CTR medio).
+        - `clicks`: stats de redirect_clicks (total links, total clicks, medio, max, min).
+        - `traffic`: contagem de dominios em `main` e `db` + ranking atual em cache.
+      parameters:
+        - $ref: '#/components/parameters/DateStart'
+        - $ref: '#/components/parameters/DateEnd'
+        - name: domain
+          in: query
+          required: false
+          schema:
+            oneOf:
+              - type: string
+              - type: array
+                items: { type: string }
+        - name: network
+          in: query
+          schema: { type: string }
+        - name: country
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: Stats agregados
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Stats' }
+        '503':
+          description: DB nao conectado
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/rank:
+    get:
+      tags: [analytics]
+      summary: Ranking de links com clickCount agregado
+      description: |
+        Cruza o ranking em cache (Redis) com a contagem de clicks (Mongo `redirects_clicks`).
+        Ordena por `clicks` (default) ou `ecpm`. Retorna em paralelo para grupos `main` e `db`.
+      parameters:
+        - name: sort
+          in: query
+          schema:
+            type: string
+            enum: [clicks, ecpm]
+            default: clicks
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 100
+            minimum: 1
+      responses:
+        '200':
+          description: Ranking
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sort: { type: string }
+                  main: { $ref: '#/components/schemas/RankResult' }
+                  db: { $ref: '#/components/schemas/RankResult' }
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/rank-by-domain:
+    get:
+      tags: [analytics]
+      summary: Ranking agrupado por dominio
+      description: Reorganiza o ranking atual em cache (`main` + `db`) agrupando os links por dominio. Util para auditar distribuicao.
+      responses:
+        '200':
+          description: Agrupado por dominio
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  main: { $ref: '#/components/schemas/RankByDomainGroup' }
+                  db: { $ref: '#/components/schemas/RankByDomainGroup' }
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/distinct/{field}:
+    get:
+      tags: [admin]
+      summary: Valores distintos de um campo do GAM ad units
+      parameters:
+        - name: field
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [domain, network, country, custom_key, custom_value, ad_unit_name]
+        - $ref: '#/components/parameters/DateStart'
+        - $ref: '#/components/parameters/DateEnd'
+      responses:
+        '200':
+          description: Valores unicos
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  field: { type: string }
+                  values:
+                    type: array
+                    items: { type: string }
+        '400':
+          description: Campo invalido
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Error'
+                  - type: object
+                    properties:
+                      validFields:
+                        type: array
+                        items: { type: string }
+        '503':
+          description: DB nao conectado
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/links:
+    get:
+      tags: [analytics]
+      summary: Listar links de redirect (collection `redirects_links`)
+      description: |
+        Retorna todos os links cadastrados no Mongo. Filtra por dominio se informado, senao paginado por `limit`/`offset`.
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 100
+            minimum: 1
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+            minimum: 0
+        - name: domain
+          in: query
+          schema: { type: string }
+          description: Se informado, retorna todos os links daquele dominio (ignora `limit`/`offset`)
+      responses:
+        '200':
+          description: Lista de links
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  links:
+                    type: array
+                    items: { $ref: '#/components/schemas/RedirectLink' }
+                  total: { type: integer }
+                  limit: { type: integer }
+                  offset: { type: integer }
+        '503':
+          description: DB nao conectado
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/broad-clicks:
+    get:
+      tags: [analytics]
+      summary: Clicks agregados por broad_id
+      description: |
+        Retorna soma de clicks por `broad_id`, filtravel por intervalo de data (YYYY-MM-DD).
+        Apenas `start` filtra a data exata; `start` + `end` filtra range.
+      parameters:
+        - name: start
+          in: query
+          schema: { type: string, format: date }
+          example: '2026-05-01'
+        - name: end
+          in: query
+          schema: { type: string, format: date }
+          example: '2026-05-08'
+      responses:
+        '200':
+          description: Clicks agregados
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/BroadClick' }
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ========================================================================
+  # RULES
+  # ========================================================================
+
+  /api/rules:
+    get:
+      tags: [rules]
+      summary: Listar regras de redirect condicional
+      responses:
+        '200':
+          description: Lista
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  rules:
+                    type: array
+                    items: { $ref: '#/components/schemas/Rule' }
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    post:
+      tags: [rules]
+      summary: Criar regra de redirect condicional
+      description: |
+        Cria regra que faz match em query params do request. Quando todas as `conditions` baterem (igualdade exata),
+        redireciona para `destination`. Se `passQueryParams=true` (default), repassa todos os query params para o destino.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [conditions, destination]
+              properties:
+                conditions:
+                  type: object
+                  description: Map de query param -> valor (todos devem bater)
+                  additionalProperties: { type: string }
+                  example:
+                    utm_source: facebook
+                    country: BR
+                destination:
+                  type: string
+                  format: uri
+                  example: https://outro-destino.com/landing
+                passQueryParams:
+                  type: boolean
+                  default: true
+                description:
+                  type: string
+                  example: Facebook BR para landing custom
+      responses:
+        '201':
+          description: Criada
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  rule: { $ref: '#/components/schemas/Rule' }
+        '400':
+          description: conditions ou destination ausentes
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/rules/{id}:
+    delete:
+      tags: [rules]
+      summary: Remover regra
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Removida
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string, example: Rule deleted }
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ========================================================================
+  # IN-APP RULES
+  # ========================================================================
+
+  /api/inapp-rules:
+    get:
+      tags: [inapp-rules]
+      summary: Listar regras de in-app
+      responses:
+        '200':
+          description: Lista
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  rules:
+                    type: array
+                    items: { $ref: '#/components/schemas/InAppRule' }
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    post:
+      tags: [inapp-rules]
+      summary: Criar regra de in-app
+      description: |
+        Regra ativada por `utm_campaign` (query OU `:campaignId` no path). Comportamento:
+        - User-agent in-app browser (Facebook FBAN/FBAV ou Instagram): redirect 302 para `destination`.
+        - Caso contrario (browser comum, crawler): retorna HTML com `<iframe>` fullscreen apontando para `destination`.
+
+        > **Aviso de seguranca (historico):** o campo `destination` e injetado em template HTML para o iframe. A equipe de seguranca (Aegis review) sinalizou
+        > risco de XSS se o caller controlar `destination` sem validacao de URL no client. Atualmente o endpoint NAO valida o formato; consumidores
+        > devem garantir que `destination` seja URL absoluta confiavel. Triado e aceito pela equipe; mitigacao no roadmap.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [utm_campaign, destination]
+              properties:
+                utm_campaign:
+                  type: string
+                  example: summer-promo
+                destination:
+                  type: string
+                  format: uri
+                  example: https://destino.com/oferta
+                passQueryParams:
+                  type: boolean
+                  default: true
+                description: { type: string }
+      responses:
+        '201':
+          description: Criada
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  rule: { $ref: '#/components/schemas/InAppRule' }
+        '400':
+          description: utm_campaign ou destination ausentes
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/inapp-rules/{id}:
+    delete:
+      tags: [inapp-rules]
+      summary: Remover regra de in-app
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Removida
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string, example: In-app rule deleted }
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+# ============================================================================
+# COMPONENTS
+# ============================================================================
+
+components:
+
+  parameters:
+
+    GroupSlug:
+      name: slug
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: '^[a-z0-9-]+$'
+      description: Slug do grupo de dominio
+      example: main
+
+    DateStart:
+      name: start
+      in: query
+      schema: { type: string, format: date }
+      description: Data inicial (YYYY-MM-DD)
+      example: '2026-05-01'
+
+    DateEnd:
+      name: end
+      in: query
+      schema: { type: string, format: date }
+      description: Data final (YYYY-MM-DD)
+      example: '2026-05-08'
+
+    UtmCampaign:
+      name: utm_campaign
+      in: query
+      schema: { type: string }
+      description: Identificador de campanha. Tambem usado para match em `InAppRules`.
+
+    UtmSource:
+      name: utm_source
+      in: query
+      schema: { type: string }
+      description: Origem do trafego. Default `redron` se ausente.
+
+    UtmMedium:
+      name: utm_medium
+      in: query
+      schema: { type: string }
+      description: Meio do trafego. Default `broadcast` se ausente.
+
+    Broad:
+      name: broad
+      in: query
+      schema: { type: string }
+      description: Quando presente, usa como `utm_campaign` E incrementa contador `broad_clicks` no Mongo.
+
+    Language:
+      name: language
+      in: query
+      schema:
+        type: string
+        enum: [en, pt, es, it, fr, de]
+      description: |
+        Codigo de idioma (ISO 639-1). Apenas dominios com logica invertida (`appmobile4u.com`, `appcombos.com`, `informanoticia.com`,
+        `buscaapp.com.br`, `lavoriinitalia.com`) recebem o prefixo no path: `pt` vai direto, `en` (default) e outros recebem prefixo `/{lang}/...`.
+
+  responses:
+
+    NotFound:
+      description: Recurso nao encontrado
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+    InternalError:
+      description: Erro interno
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+
+    Error:
+      type: object
+      properties:
+        error: { type: string, example: 'Failed to do something' }
+        message: { type: string, example: 'Optional details' }
+        timestamp: { type: string, format: date-time }
+      required: [error]
+
+    HealthBasic:
+      type: object
+      properties:
+        status: { type: string, example: healthy }
+        timestamp: { type: string, format: date-time }
+
+    HealthDetailed:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [healthy, degraded]
+        timestamp: { type: string, format: date-time }
+        services:
+          type: object
+          properties:
+            api:
+              type: string
+              enum: [healthy, unhealthy]
+            database:
+              type: string
+              enum: [healthy, unhealthy, unknown]
+            redis:
+              type: string
+              enum: [healthy, unhealthy, unknown]
+
+    DomainGroup:
+      type: object
+      description: Grupo de dominios. Cada grupo tem ranking proprio e configuracao de modo (best-RPS ou round-robin).
+      properties:
+        _id: { type: string, description: ObjectId do MongoDB }
+        slug:
+          type: string
+          pattern: '^[a-z0-9-]+$'
+          example: main
+        name:
+          type: string
+          example: Main Domains
+        domains:
+          type: array
+          items: { type: string, format: hostname }
+          example: ['site1.com', 'site2.com']
+        active:
+          type: boolean
+          example: true
+        bestRpsMode:
+          type: boolean
+          description: Se true, usa best-RPS por IP (mais lento, mais inteligente). Se false/ausente, round-robin.
+          example: false
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+      required: [slug, name, domains, active]
+
+    Rule:
+      type: object
+      description: Regra de redirect condicional baseada em query params (storage Redis).
+      properties:
+        id:
+          type: string
+          example: '1730983412_a7b9c2'
+          description: '`{timestamp}_{6 hex chars}` gerado no momento da criacao'
+        conditions:
+          type: object
+          additionalProperties: { type: string }
+          example:
+            utm_source: facebook
+            country: BR
+        destination:
+          type: string
+          format: uri
+        passQueryParams: { type: boolean, default: true }
+        active: { type: boolean, default: true }
+        description: { type: string }
+      required: [id, conditions, destination, passQueryParams, active]
+
+    InAppRule:
+      type: object
+      description: |
+        Regra de in-app browser (storage Redis). Match por `utm_campaign`.
+        Comportamento branchea por User-Agent: in-app -> redirect; outros -> HTML iframe.
+      properties:
+        id: { type: string }
+        utm_campaign: { type: string, example: summer-promo }
+        destination: { type: string, format: uri }
+        passQueryParams: { type: boolean, default: true }
+        active: { type: boolean, default: true }
+        description: { type: string }
+      required: [id, utm_campaign, destination, passQueryParams, active]
+
+    RankedLink:
+      type: object
+      description: Item do ranking eCPM/RPS (cache Redis, recalculado a cada 15 min).
+      properties:
+        url: { type: string, format: uri }
+        domain: { type: string }
+        postId: { type: string, description: ID do post no WP, ou `random` quando dominio sem dados }
+        ecpm: { type: number, format: float }
+        revenue: { type: number, format: float }
+        uniqueVisitors: { type: integer }
+        rps:
+          type: number
+          format: float
+          description: Revenue per session (revenue / uniqueVisitors)
+      required: [url, domain, postId, ecpm, revenue, uniqueVisitors, rps]
+
+    RankResultItem:
+      type: object
+      properties:
+        url: { type: string, format: uri }
+        domain: { type: string }
+        postId: { type: string }
+        ecpm: { type: number }
+        clickCount: { type: integer }
+
+    RankResult:
+      type: object
+      properties:
+        rank:
+          type: array
+          items: { $ref: '#/components/schemas/RankResultItem' }
+        total: { type: integer }
+
+    RankByDomainItem:
+      type: object
+      properties:
+        position: { type: integer, description: Posicao 1-based no ranking original }
+        postId: { type: string }
+        url: { type: string, format: uri }
+        ecpm: { type: number }
+        source:
+          type: string
+          enum: [main, db]
+
+    RankByDomainGroup:
+      type: object
+      properties:
+        total_links: { type: integer }
+        domains: { type: integer }
+        by_domain:
+          type: object
+          additionalProperties:
+            type: array
+            items: { $ref: '#/components/schemas/RankByDomainItem' }
+
+    Stats:
+      type: object
+      properties:
+        gam:
+          type: object
+          properties:
+            totalRecords: { type: integer }
+            totalImpressions: { type: number }
+            totalClicks: { type: number }
+            totalRevenue: { type: number }
+            avgEcpm: { type: number }
+            avgCtr: { type: number }
+            dateRange:
+              type: object
+              properties:
+                start: { type: string, format: date }
+                end: { type: string, format: date }
+        clicks:
+          type: object
+          properties:
+            totalLinks: { type: integer }
+            totalClicks: { type: integer }
+            averageClicksPerLink: { type: integer }
+            maxClicks: { type: integer }
+            minClicks: { type: integer }
+        traffic:
+          type: object
+          properties:
+            totalDomains: { type: integer, description: Quantidade de dominios no grupo `main` }
+            totalDomainsDb: { type: integer, description: Quantidade de dominios no grupo `db` }
+            globalRanking:
+              type: array
+              items: { $ref: '#/components/schemas/RankedLink' }
+            globalRankingDb:
+              type: array
+              items: { $ref: '#/components/schemas/RankedLink' }
+
+    RedirectLink:
+      type: object
+      description: Link de redirect armazenado no Mongo (collection `redirects_links`).
+      properties:
+        _id: { type: string }
+        domain: { type: string, format: hostname }
+        url: { type: string, format: uri }
+        status: { type: boolean, description: Ativo/inativo }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+      required: [domain, url, status]
+
+    BroadClick:
+      type: object
+      description: Agregacao de clicks por `broad_id`.
+      properties:
+        broad_id: { type: string }
+        total_clicks: { type: integer }
+      required: [broad_id, total_clicks]

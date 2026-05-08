@@ -101,6 +101,18 @@ export class RedirectController {
     private validPostsCacheTime: number = 0;
     private readonly VALID_POSTS_CACHE_TTL_MS = 900000; // 15 minutos
 
+    // Debug flag — habilita console.log per-request quando DEBUG_REDIRECT=1
+    private static readonly DEBUG_REDIRECT = process.env.DEBUG_REDIRECT === '1';
+
+    // Domínios com lógica invertida de idioma (apenas estes recebem prefixo)
+    private static readonly INVERTED_LANG_DOMAINS = new Set<string>([
+        'appmobile4u.com',
+        'appcombos.com',
+        'informanoticia.com',
+        'buscaapp.com.br',
+        'lavoriinitalia.com',
+    ]);
+
     constructor(db?: Db) {
         this.superFilterService = new SuperFilterService();
         this.pageviewService = new PageviewService();
@@ -589,12 +601,17 @@ export class RedirectController {
         if (!this.redisClient) return 0;
 
         const key = `redirect:global_counter:${slug}`;
-        const count = await this.redisClient.incr(key);
-        // TTL de 1 hora — reseta o counter a cada hora
-        if (count === 1) {
-            await this.redisClient.expire(key, 3600);
+        try {
+            const count = await this.redisClient.incr(key);
+            // TTL de 1 hora — reseta o counter a cada hora
+            if (count === 1) {
+                await this.redisClient.expire(key, 3600);
+            }
+            return count - 1;
+        } catch (err) {
+            console.error('[REDIS] getGlobalVisitIndex failed', err);
+            return 0;
         }
-        return count - 1;
     }
 
     /**
@@ -603,13 +620,17 @@ export class RedirectController {
     private async addVisitedDomain(ip: string, type: 'main' | 'db', domain: string): Promise<void> {
         if (!this.redisClient) return;
         const key = this.getVisitorKey(ip, type);
-        const added = await this.redisClient.sadd(key, domain);
-        // Se foi o primeiro elemento adicionado, setar TTL
-        if (added === 1) {
-            const ttl = await this.redisClient.ttl(key);
-            if (ttl === -1) {
-                await this.redisClient.expire(key, 3600);
+        try {
+            const added = await this.redisClient.sadd(key, domain);
+            // Se foi o primeiro elemento adicionado, setar TTL
+            if (added === 1) {
+                const ttl = await this.redisClient.ttl(key);
+                if (ttl === -1) {
+                    await this.redisClient.expire(key, 3600);
+                }
             }
+        } catch (err) {
+            console.error('[REDIS] addVisitedDomain failed', err);
         }
     }
 
@@ -746,9 +767,14 @@ export class RedirectController {
      */
     private async saveRules(rules: RedirectRule[]): Promise<void> {
         if (!this.redisClient) return;
-        await this.redisClient.set(this.REDIRECT_RULES_KEY, JSON.stringify(rules));
-        this.rulesCache = rules;
-        this.rulesCacheTime = Date.now();
+        try {
+            await this.redisClient.set(this.REDIRECT_RULES_KEY, JSON.stringify(rules));
+            this.rulesCache = rules;
+            this.rulesCacheTime = Date.now();
+        } catch (err) {
+            console.error('[REDIS] saveRules failed', err);
+            throw err;
+        }
     }
 
     /**
@@ -911,9 +937,14 @@ export class RedirectController {
      */
     private async saveInAppRules(rules: InAppRule[]): Promise<void> {
         if (!this.redisClient) return;
-        await this.redisClient.set(this.INAPP_RULES_KEY, JSON.stringify(rules));
-        this.inAppRulesCache = rules;
-        this.inAppRulesCacheTime = Date.now();
+        try {
+            await this.redisClient.set(this.INAPP_RULES_KEY, JSON.stringify(rules));
+            this.inAppRulesCache = rules;
+            this.inAppRulesCacheTime = Date.now();
+        } catch (err) {
+            console.error('[REDIS] saveInAppRules failed', err);
+            throw err;
+        }
     }
 
     /**
@@ -1010,7 +1041,7 @@ export class RedirectController {
                         if (value) ruleUrl.searchParams.append(key, String(value));
                     }
                 }
-                console.log(`[RULE REDIRECT] ${matchedRule.id} (${matchedRule.description}) -> ${ruleUrl.toString()}`);
+                if (RedirectController.DEBUG_REDIRECT) console.log(`[RULE REDIRECT] ${matchedRule.id} (${matchedRule.description}) -> ${ruleUrl.toString()}`);
                 res.redirect(ruleUrl.toString());
                 return;
             }
@@ -1018,10 +1049,8 @@ export class RedirectController {
             // Verificar regras de in-app/iframe
             // utm_campaign pode vir da query string OU do path (/:campaignId)
             const utmCampaign = (req.query.utm_campaign as string) || (req.params.campaignId as string);
-            console.log(`[DEBUG INAPP] campaignId=${req.params?.campaignId} utmCampaign=${utmCampaign} path=${req.path}`);
             if (utmCampaign) {
                 const inAppRules = await this.getInAppRules();
-                console.log(`[DEBUG INAPP] rules count=${inAppRules.length} rules=${JSON.stringify(inAppRules.map(r => ({ id: r.id, utm_campaign: r.utm_campaign, active: r.active })))}`);
                 const inAppMatch = inAppRules.find(r => r.active && r.utm_campaign === utmCampaign);
 
                 if (inAppMatch) {
@@ -1041,11 +1070,11 @@ export class RedirectController {
 
                     if (isInApp) {
                         // In-app (Facebook/Instagram) -> redirect para destino
-                        console.log(`[INAPP REDIRECT] ${inAppMatch.id} campaign=${utmCampaign} -> ${finalUrl}`);
+                        if (RedirectController.DEBUG_REDIRECT) console.log(`[INAPP REDIRECT] ${inAppMatch.id} campaign=${utmCampaign} -> ${finalUrl}`);
                         res.redirect(finalUrl);
                     } else {
                         // Não é in-app (Meta crawler, navegador normal) -> iframe
-                        console.log(`[IFRAME] ${inAppMatch.id} campaign=${utmCampaign} -> ${finalUrl}`);
+                        if (RedirectController.DEBUG_REDIRECT) console.log(`[IFRAME] ${inAppMatch.id} campaign=${utmCampaign} -> ${finalUrl}`);
                         res.send(this.generateIframeHtml(finalUrl));
                     }
                     return;
@@ -1095,16 +1124,26 @@ export class RedirectController {
                 redirectUrl = `https://${domain}${generateRandomPath()}`;
                 linkId = `fallback_${domain}`;
                 logType = 'RANDOM LINK';
-                console.log(`[DEBUG] ranking global está VAZIO - rode /api/process para popular`);
+                if (RedirectController.DEBUG_REDIRECT) console.log(`[DEBUG] ranking global está VAZIO - rode /api/process para popular`);
             }
 
-            // Dominios com logica invertida de idioma (APENAS estes recebem prefixo)
-            const invertedLangDomains = ['appmobile4u.com', 'appcombos.com', 'informanoticia.com', 'buscaapp.com.br', 'lavoriinitalia.com'];
-            const url = new URL(redirectUrl);
-            const isInvertedDomain = invertedLangDomains.some(d => url.hostname === d);
+            // Domínios com lógica invertida de idioma (APENAS estes recebem prefixo).
+            // Fast-path: extrair hostname por substring e checar Set antes de pagar new URL().
+            const hostStart = redirectUrl.indexOf('//');
+            let hostname = '';
+            if (hostStart !== -1) {
+                const afterScheme = redirectUrl.slice(hostStart + 2);
+                const pathStart = afterScheme.indexOf('/');
+                hostname = pathStart === -1 ? afterScheme : afterScheme.slice(0, pathStart);
+                const qIdx = hostname.indexOf('?');
+                if (qIdx !== -1) hostname = hostname.slice(0, qIdx);
+                hostname = hostname.toLowerCase();
+            }
+            const isInvertedDomain = RedirectController.INVERTED_LANG_DOMAINS.has(hostname);
 
             // Só adiciona prefixo de idioma nos domínios invertidos — todos os outros vão direto
             if (isInvertedDomain) {
+                const url = new URL(redirectUrl);
                 if (!language || language === 'en') {
                     url.pathname = `/en${url.pathname}`;
                     redirectUrl = url.toString();
@@ -1115,9 +1154,11 @@ export class RedirectController {
                 // Se language=pt, nao adiciona nada (acesso direto)
             }
 
-            // Log com informacao de idioma e dominio
-            const langInfo = isInvertedDomain ? (language ? ` [${language.toUpperCase()}]` : ' [EN]') : '';
-            console.log(`[${logType}]${langInfo} ${domain} -> ${redirectUrl}`);
+            // Log com informacao de idioma e dominio (gated por DEBUG_REDIRECT)
+            if (RedirectController.DEBUG_REDIRECT) {
+                const langInfo = isInvertedDomain ? (language ? ` [${language.toUpperCase()}]` : ' [EN]') : '';
+                console.log(`[${logType}]${langInfo} ${domain} -> ${redirectUrl}`);
+            }
 
             // Repassa TODOS os query params recebidos, com defaults para UTMs
             const allParams = new URLSearchParams();
@@ -1139,21 +1180,12 @@ export class RedirectController {
             const separator = redirectUrl.includes('?') ? '&' : '?';
             const finalRedirectUrl = `${redirectUrl}${separator}${allParams.toString()}`;
 
-            // Registrar click
+            // Registrar click (fire-and-forget, sem log per-request)
             if (linkId && this.redirectClickRepository) {
-                this.redirectClickRepository.incrementClick(linkId)
-                    .then(result => console.log(`[CLICK RECORDED] LinkID: ${linkId}, New Count: ${result.count}`))
-                    .catch(() => {});
+                this.redirectClickRepository.incrementClick(linkId).catch(() => {});
             }
             if (broad && this.broadClickRepository) {
-                this.broadClickRepository.incrementClick(broad)
-                    .then(result => console.log(`[CLICK RECORDED BROAD] ${broad}, New Count: ${result.count}`))
-                    .catch(() => {});
-            }
-
-            // Cache anti-duplicacao (fire and forget)
-            if (this.redisClient) {
-                this.redisClient.set(`recent:${clientIp}`, finalRedirectUrl, 'EX', 5).catch(() => {});
+                this.broadClickRepository.incrementClick(broad).catch(() => {});
             }
 
             res.redirect(finalRedirectUrl);
@@ -1201,10 +1233,10 @@ export class RedirectController {
                     const isInApp = this.isInAppBrowser(userAgent);
 
                     if (isInApp) {
-                        console.log(`[INAPP REDIRECT ${slug.toUpperCase()}] ${inAppMatch.id} campaign=${utmCampaign} -> ${finalUrl}`);
+                        if (RedirectController.DEBUG_REDIRECT) console.log(`[INAPP REDIRECT ${slug.toUpperCase()}] ${inAppMatch.id} campaign=${utmCampaign} -> ${finalUrl}`);
                         res.redirect(finalUrl);
                     } else {
-                        console.log(`[IFRAME ${slug.toUpperCase()}] ${inAppMatch.id} campaign=${utmCampaign} -> ${finalUrl}`);
+                        if (RedirectController.DEBUG_REDIRECT) console.log(`[IFRAME ${slug.toUpperCase()}] ${inAppMatch.id} campaign=${utmCampaign} -> ${finalUrl}`);
                         res.send(this.generateIframeHtml(finalUrl));
                     }
                     return;
@@ -1249,11 +1281,13 @@ export class RedirectController {
                 redirectUrl = `https://${domain}${generateRandomPath()}`;
                 linkId = `fallback_${slug}_${domain}`;
                 logType = `RANDOM LINK ${slug.toUpperCase()}`;
-                console.log(`[DEBUG-${slug.toUpperCase()}] ranking global está VAZIO - rode /api/process para popular`);
+                if (RedirectController.DEBUG_REDIRECT) console.log(`[DEBUG-${slug.toUpperCase()}] ranking global está VAZIO - rode /api/process para popular`);
             }
 
-            // Log
-            console.log(`[${logType}] ${domain} -> ${redirectUrl}`);
+            // Log (gated por DEBUG_REDIRECT)
+            if (RedirectController.DEBUG_REDIRECT) {
+                console.log(`[${logType}] ${domain} -> ${redirectUrl}`);
+            }
 
             // Repassa TODOS os query params recebidos, com defaults para UTMs
             const allParams = new URLSearchParams();
@@ -1275,21 +1309,12 @@ export class RedirectController {
             const separator = redirectUrl.includes('?') ? '&' : '?';
             const finalRedirectUrl = `${redirectUrl}${separator}${allParams.toString()}`;
 
-            // Registrar click
+            // Registrar click (fire-and-forget, sem log per-request)
             if (linkId && this.redirectClickRepository) {
-                this.redirectClickRepository.incrementClick(linkId)
-                    .then(result => console.log(`[CLICK RECORDED ${slug.toUpperCase()}] LinkID: ${linkId}, New Count: ${result.count}`))
-                    .catch(() => {});
+                this.redirectClickRepository.incrementClick(linkId).catch(() => {});
             }
             if (broad && this.broadClickRepository) {
-                this.broadClickRepository.incrementClick(broad)
-                    .then(result => console.log(`[CLICK RECORDED BROAD ${slug.toUpperCase()}] ${broad}, New Count: ${result.count}`))
-                    .catch(() => {});
-            }
-
-            // Cache anti-duplicacao (fire and forget)
-            if (this.redisClient) {
-                this.redisClient.set(`recent:${clientIp}`, finalRedirectUrl, 'EX', 5).catch(() => {});
+                this.broadClickRepository.incrementClick(broad).catch(() => {});
             }
 
             res.redirect(finalRedirectUrl);

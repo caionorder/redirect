@@ -8,6 +8,7 @@ export class DomainGroupService {
     private cache: Map<string, string[]> = new Map();
     private groupConfigCache: Map<string, IDomainGroup> = new Map();
     private allGroupsCache: IDomainGroup[] = [];
+    private activeSlugsArrayCache: string[] = [];
     private cacheTime: number = 0;
     private readonly CACHE_TTL_MS = 60000; // 1 minuto
 
@@ -72,6 +73,7 @@ export class DomainGroupService {
                 this.groupConfigCache.set(group.slug, group);
             }
             this.allGroupsCache = await this.repository.findAll();
+            this.activeSlugsArrayCache = Array.from(this.cache.keys());
             this.cacheTime = Date.now();
         } catch (error) {
             console.error('[DomainGroupService] Error refreshing cache:', error);
@@ -117,6 +119,15 @@ export class DomainGroupService {
     async getActiveSlugs(): Promise<string[]> {
         await this.ensureCache();
         return Array.from(this.cache.keys());
+    }
+
+    /**
+     * Versao sincrona de getActiveSlugs. Usa array memoizado.
+     * Pre-condicao: cache ja foi populado (refreshCache chamado pelo seed() no boot).
+     * Em hot path, evita microtask por request.
+     */
+    getActiveSlugsSync(): string[] {
+        return this.activeSlugsArrayCache;
     }
 
     /**

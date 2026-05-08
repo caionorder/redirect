@@ -1,4 +1,4 @@
-import express, { Express } from 'express';
+import express, { Express, Router } from 'express';
 import cors from 'cors';
 import compression from 'compression';
 import helmet from 'helmet';
@@ -7,6 +7,7 @@ import { connectDB } from './config/database';
 import { redis } from './config/redis';
 //import { limiter } from './config/rate-limit';
 import { createHealthRouter } from './routes/health-route';
+import { createDocsRouter } from './routes/docs-route';
 import { createRedirectRouter } from './routes/redirect-route';
 import { RedirectController } from './controllers/redirect-controller';
 import { errorHandler } from './middleware/error-handler';
@@ -17,47 +18,9 @@ import { createDomainGroupRouter } from './routes/domain-group-route';
 export async function createApp(): Promise<Express> {
     const app = express();
 
-    // CSP inicial mínimo — será atualizado com domínios do banco após conectar
-    app.use(helmet({
-        contentSecurityPolicy: {
-            directives: {
-                defaultSrc: ["'self'"],
-                frameSrc: ["'self'", "*"],
-                frameAncestors: ["'self'"],
-                scriptSrc: ["'self'", "'unsafe-inline'"],
-                styleSrc: ["'self'", "'unsafe-inline'"],
-            }
-        }
-    }));
     app.set('trust proxy', 1);
     app.disable('x-powered-by');
     app.set('etag', false);
-
-    // Logging - formato simplificado
-    if (process.env.NODE_ENV !== 'test') {
-        app.use(morgan('[UTM REQUEST] :method :url'));
-    }
-
-    // Compressão
-    app.use(compression({
-        level: 6,
-        threshold: 1024 // Comprimir apenas respostas > 1KB
-    }));
-
-    // CORS
-    app.use(cors({
-        origin: process.env.CORS_ORIGIN || '*',
-        methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-        allowedHeaders: ['Content-Type', 'Authorization'],
-        credentials: true
-    }));
-
-    // Body parsing
-    app.use(express.json({ limit: '10mb' }));
-    app.use(express.urlencoded({ extended: true, limit: '10mb' }));
-
-    // Rate limiting
-    //app.use('/api/', limiter);
 
     // Conectar ao MongoDB
     let db: Db | undefined;
@@ -83,8 +46,15 @@ export async function createApp(): Promise<Express> {
         // Continua rodando sem Redis se falhar
     }
 
-    // Rotas de health check (sempre disponíveis)
+    // Rotas de health check (sempre disponíveis, sem middlewares pesados)
     app.use(createHealthRouter(db));
+
+    // Rotas de documentação OpenAPI (Redoc + Swagger UI)
+    // Sempre disponíveis, independente de DB:
+    //   GET /openapi.json - spec OpenAPI 3.0
+    //   GET /redocs       - UI Redoc
+    //   GET /api-docs     - UI Swagger
+    app.use(createDocsRouter());
 
     // Rotas principais da aplicação
     if (db) {
@@ -92,9 +62,49 @@ export async function createApp(): Promise<Express> {
         const domainGroupService = DomainGroupService.getInstance(db);
         await domainGroupService.seed();
 
-
-        // Criar o controller de redirect uma vez
+        // Criar o controller de redirect uma vez (singleton) — injetado em todas as rotas
         const redirectController = new RedirectController(db);
+
+        // Router /api com middlewares pesados (helmet, cors, compression, json, urlencoded, morgan).
+        // Hot path de redirect (/, /:slug, /db) NÃO passa por estes middlewares.
+        const apiRouter = Router();
+
+        apiRouter.use(helmet({
+            contentSecurityPolicy: {
+                directives: {
+                    defaultSrc: ["'self'"],
+                    frameSrc: ["'self'", "*"],
+                    frameAncestors: ["'self'"],
+                    scriptSrc: ["'self'", "'unsafe-inline'"],
+                    styleSrc: ["'self'", "'unsafe-inline'"],
+                }
+            }
+        }));
+
+        apiRouter.use(compression({
+            level: 6,
+            threshold: 1024 // Comprimir apenas respostas > 1KB
+        }));
+
+        apiRouter.use(cors({
+            origin: process.env.CORS_ORIGIN || '*',
+            methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+            allowedHeaders: ['Content-Type', 'Authorization'],
+            credentials: true
+        }));
+
+        apiRouter.use(express.json({ limit: '10mb' }));
+        apiRouter.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+        if (process.env.NODE_ENV !== 'test' && process.env.NODE_ENV !== 'production') {
+            apiRouter.use(morgan('[UTM REQUEST] :method :url'));
+        }
+
+        // Montar sub-routers em /api
+        apiRouter.use('/domain-groups', createDomainGroupRouter(domainGroupService));
+        apiRouter.use('/', createRedirectRouter(redirectController));
+
+        app.use('/api', apiRouter);
 
         // IMPORTANTE: Rota raiz "/" executa o redirect diretamente (grupo "main")
         app.get('/', (req, res) => redirectController.redirect(req, res));
@@ -102,53 +112,28 @@ export async function createApp(): Promise<Express> {
         // Rota "/db" executa o redirect usando grupo "db"
         app.get('/db', (req, res) => redirectController.redirectByGroup(req, res, 'db'));
 
-        // Montar as rotas em /api (antes das rotas com :campaignId para não conflitar)
-        app.use('/api', createRedirectRouter(db));
-
-        // Montar rotas de CRUD de domain groups
-        app.use('/api/domain-groups', createDomainGroupRouter(domainGroupService));
-
-        // Registrar rotas estáticas para slugs que existem no startup (rápido, sem lookup)
-        try {
-            const slugs = await domainGroupService.getActiveSlugs();
-            for (const slug of slugs) {
-                if (slug === 'main' || slug === 'db') continue;
-                console.log(`[ROUTES] Registering route /${slug}`);
-                app.get(`/${slug}`, (req, res) => redirectController.redirectByGroup(req, res, slug));
-                app.get(`/${slug}/:campaignId`, (req, res) => redirectController.redirectByGroup(req, res, slug));
-            }
-        } catch (error) {
-            console.error('[ROUTES] Error registering dynamic routes:', error);
-        }
-
         // Rotas estáticas para /db com campaignId
         app.get('/db/:campaignId', (req, res) => redirectController.redirectByGroup(req, res, 'db'));
 
-        // Catch-all: captura slugs criados após startup + campaignId do main
+        // Catch-all: captura slugs (criados em qualquer momento) + fallback pra grupo main
         app.get('/:param', (req, res) => {
             const param = req.params.param;
-            domainGroupService.getActiveSlugs()
-                .then(slugs => {
-                    if (slugs.includes(param) && param !== 'main') {
-                        redirectController.redirectByGroup(req, res, param);
-                    } else {
-                        redirectController.redirect(req, res);
-                    }
-                })
-                .catch(() => redirectController.redirect(req, res));
+            const slugs = domainGroupService.getActiveSlugsSync();
+            if (slugs.includes(param) && param !== 'main') {
+                redirectController.redirectByGroup(req, res, param);
+            } else {
+                redirectController.redirect(req, res);
+            }
         });
 
         app.get('/:param/:campaignId', (req, res) => {
             const param = req.params.param;
-            domainGroupService.getActiveSlugs()
-                .then(slugs => {
-                    if (slugs.includes(param) && param !== 'main') {
-                        redirectController.redirectByGroup(req, res, param);
-                    } else {
-                        redirectController.redirect(req, res);
-                    }
-                })
-                .catch(() => redirectController.redirect(req, res));
+            const slugs = domainGroupService.getActiveSlugsSync();
+            if (slugs.includes(param) && param !== 'main') {
+                redirectController.redirectByGroup(req, res, param);
+            } else {
+                redirectController.redirect(req, res);
+            }
         });
     } else {
         // Rota de fallback se não houver DB
