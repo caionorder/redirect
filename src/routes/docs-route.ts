@@ -4,7 +4,14 @@ import * as path from 'path';
 import * as yaml from 'js-yaml';
 import swaggerUi from 'swagger-ui-express';
 
-const SPEC_PATH = path.resolve(__dirname, '../../docs/openapi.yaml');
+const SPEC_PATH = (() => {
+    const candidates = [
+        path.resolve(process.cwd(), 'docs/openapi.yaml'),
+        path.resolve(__dirname, '../../docs/openapi.yaml'),
+        path.resolve(__dirname, '../../../docs/openapi.yaml'),
+    ];
+    return candidates.find(p => fs.existsSync(p)) ?? candidates[0];
+})();
 
 let cachedSpec: unknown | null = null;
 
@@ -47,8 +54,15 @@ export function createDocsRouter(): Router {
         res.status(200).type('html').send(REDOC_HTML);
     });
 
-    const spec = loadSpec();
-    router.use('/api-docs', swaggerUi.serveFiles(spec as Record<string, unknown>), swaggerUi.setup(spec as Record<string, unknown>));
+    try {
+        const spec = loadSpec();
+        router.use('/api-docs', swaggerUi.serveFiles(spec as Record<string, unknown>), swaggerUi.setup(spec as Record<string, unknown>));
+    } catch (error) {
+        console.error('[DOCS] Failed to mount /api-docs (spec not found):', error);
+        router.get('/api-docs', (_req: Request, res: Response) => {
+            res.status(503).json({ error: 'API docs unavailable: OpenAPI spec not found' });
+        });
+    }
 
     return router;
 }
