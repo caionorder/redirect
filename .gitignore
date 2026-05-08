@@ -130,3 +130,6 @@ temp/
 *.pid
 *.seed
 *.pid.lock
+
+# Claude AI
+.claude/
