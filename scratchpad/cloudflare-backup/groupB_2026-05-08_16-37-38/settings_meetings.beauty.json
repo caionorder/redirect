@@ -1,0 +1,14 @@
+{"settings":[
+{"result":{"id":"ssl","value":"full","modified_on":null,"certificate_status":"initializing","validation_errors":[],"editable":true},"success":true,"errors":[],"messages":[]},
+{"result":{"id":"always_use_https","value":"off","editable":true},"success":true,"errors":[],"messages":[],"result_info":{}}
+,
+{"result":{"id":"min_tls_version","value":"1.0","modified_on":null,"editable":true},"success":true,"errors":[],"messages":[]},
+{"result":{"id":"0rtt","value":"off","modified_on":null,"editable":true},"success":true,"errors":[],"messages":[]},
+{"result":{"id":"browser_cache_ttl","value":14400,"editable":true},"success":true,"errors":[],"messages":[],"result_info":{}}
+,
+{"result":{"id":"cache_level","value":"aggressive","editable":true},"success":true,"errors":[],"messages":[],"result_info":{}}
+,
+{"result":{"id":"http3","value":"on","modified_on":null,"editable":true},"success":true,"errors":[],"messages":[]},
+{"result":{"id":"http2","value":"on","modified_on":null,"editable":false},"success":true,"errors":[],"messages":[]},
+{"result":{"id":"brotli","value":"on","editable":true},"success":true,"errors":[],"messages":[],"result_info":{}}
+]}

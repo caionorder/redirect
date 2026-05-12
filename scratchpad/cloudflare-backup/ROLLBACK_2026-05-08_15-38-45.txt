@@ -1,0 +1,29 @@
+ROLLBACK CHEAT-SHEET (timestamp: 2026-05-08_15-38-45)
+
+To revert any change, run the curl with X-Auth-Email + X-Auth-Key headers.
+
+=== ORIGINAL VALUES ===
+DNS A record id (need to look up):
+  GET /zones/9e888ec259cc5f0d1188e157af1f01dc/dns_records  -> find id of "redirect.plus" A record
+  PATCH /zones/9e888ec259cc5f0d1188e157af1f01dc/dns_records/<id>  body: {"proxied": false}
+
+Settings to revert:
+  browser_cache_ttl: from 0 -> back to 14400
+  min_tls_version:   from 1.2 -> back to 1.0
+  ssl:               from strict -> back to full
+  always_use_https:  from on -> back to off
+  0rtt:              from on -> back to off
+
+Single API call template:
+  curl -sS -X PATCH "https://api.cloudflare.com/client/v4/zones/9e888ec259cc5f0d1188e157af1f01dc/settings/<NAME>" \
+    -H "X-Auth-Email: caio@caionorder.com" \
+    -H "X-Auth-Key: $CF_KEY" \
+    -H "Content-Type: application/json" \
+    -d '{"value":"<ORIGINAL_VALUE>"}'
+
+EMERGENCY: revert DNS to non-proxied (kills CDN, restores direct):
+  Get record id from /Users/caionorder/Dev/redirect/scratchpad/cloudflare-backup/dns_records_2026-05-08_15-38-45.json (look for redirect.plus, type=A)
+  curl -sS -X PATCH "https://api.cloudflare.com/client/v4/zones/9e888ec259cc5f0d1188e157af1f01dc/dns_records/<id>" \
+    -H "X-Auth-Email: caio@caionorder.com" -H "X-Auth-Key: $CF_KEY" \
+    -H "Content-Type: application/json" \
+    -d '{"proxied": false}'

@@ -1042,6 +1042,7 @@ export class RedirectController {
                     }
                 }
                 if (RedirectController.DEBUG_REDIRECT) console.log(`[RULE REDIRECT] ${matchedRule.id} (${matchedRule.description}) -> ${ruleUrl.toString()}`);
+                res.setHeader('Cache-Control', 'private, no-store');
                 res.redirect(ruleUrl.toString());
                 return;
             }
@@ -1071,6 +1072,7 @@ export class RedirectController {
                     if (isInApp) {
                         // In-app (Facebook/Instagram) -> redirect para destino
                         if (RedirectController.DEBUG_REDIRECT) console.log(`[INAPP REDIRECT] ${inAppMatch.id} campaign=${utmCampaign} -> ${finalUrl}`);
+                        res.setHeader('Cache-Control', 'private, no-store');
                         res.redirect(finalUrl);
                     } else {
                         // Não é in-app (Meta crawler, navegador normal) -> iframe
@@ -1188,9 +1190,11 @@ export class RedirectController {
                 this.broadClickRepository.incrementClick(broad).catch(() => {});
             }
 
+            res.setHeader('Cache-Control', 'private, no-store');
             res.redirect(finalRedirectUrl);
         } catch (error) {
             console.error('Error in redirect:', error);
+            res.setHeader('Cache-Control', 'private, no-store');
             res.redirect('https://useuapp.com/random');
         }
     }
@@ -1234,6 +1238,7 @@ export class RedirectController {
 
                     if (isInApp) {
                         if (RedirectController.DEBUG_REDIRECT) console.log(`[INAPP REDIRECT ${slug.toUpperCase()}] ${inAppMatch.id} campaign=${utmCampaign} -> ${finalUrl}`);
+                        res.setHeader('Cache-Control', 'private, no-store');
                         res.redirect(finalUrl);
                     } else {
                         if (RedirectController.DEBUG_REDIRECT) console.log(`[IFRAME ${slug.toUpperCase()}] ${inAppMatch.id} campaign=${utmCampaign} -> ${finalUrl}`);
@@ -1317,6 +1322,7 @@ export class RedirectController {
                 this.broadClickRepository.incrementClick(broad).catch(() => {});
             }
 
+            res.setHeader('Cache-Control', 'private, no-store');
             res.redirect(finalRedirectUrl);
         } catch (error) {
             console.error(`Error in redirectByGroup(${slug}):`, error);
