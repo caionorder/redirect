@@ -1,189 +1,219 @@
-# Hera — Code Performance Review (redirect)
+# Code Review — Fix utm_term (Athena) — Hera
 
-Escopo: TypeScript em `src/`. Foco: TTFB do hot path (`/`, `/db`, `/:slug`).
-Modo: read-only. Findings com severidade [BLOCKER|HIGH|MED|LOW].
+## Veredito
+**APROVADO COM RESSALVAS**
 
----
+O fix do controller é correto, idiomático e atende ao escopo declarado. Não há regressão na lógica do código que executa em produção. **Porém** a troca `append → set` muda a semântica de "request + destination empilhadas" para "request vence destination", o que **pode** alterar o comportamento percebido de regras existentes no Redis que tinham UTMs hardcoded nas suas `destination`. Auditoria das regras no Redis é obrigatória antes do deploy.
 
-## Hot path (redirect-controller)
+## Sumário executivo
 
-### BLOCKER — Controller duplicado e cron duplicado por worker
-- `src/app.ts:97` cria `new RedirectController(db)` (instância A).
-- `src/app.ts:106` monta `createRedirectRouter(db)` que em `src/routes/redirect-route.ts:7` cria **outra** `new RedirectController(db)` (instância B).
-- Cada instância:
-  - tem caches **separados** (`bestLinksMapCaches`, `validPostsCache`, `rulesCache`, `inAppRulesCache`) → cache hit rate efetivo cai pela metade.
-  - chama `initializeScheduledProcess()` no construtor (`redirect-controller.ts:117-121`). Em worker 1, isso dispara **2 crons em paralelo + 2 `executeAllGroups()` no startup** (chamadas WP-VALIDATE e pageview duplicadas).
-  - chama `RedirectClickRepository.createIndex()` 2x no boot.
-- Recomendação: `RedirectController` deve ser singleton. Instanciar 1x em `app.ts` e injetar em `createRedirectRouter(controller)`.
+- As regras "broad → utm_campaign" e os defaults de UTMs **não foram tocados** pelo fix — ficam no hot path principal (`L1184-1189` e `L1314-1319`), que só executa **após** ambos os early-returns de Rule/InApp falharem. Esses fluxos seguem idênticos. ✅
+- A "regra do term" não existe no código — é dado configurado no Redis (`redirect:rules` ou `redirect:inapp_rules`). Para essas regras, o fix preserva `utm_term`, `utm_content`, etc. (era esse o objetivo). ✅
+- **Não quebra nada** em qualquer regra com `passQueryParams: false` (comportamento idêntico: descarta tudo do request, mantém destination intacta). ✅
+- **Muda comportamento** em regras com `passQueryParams: true` cuja `destination` já tem `utm_X=valor` hardcoded: antes ficava duplicata, agora o valor do request sobrescreve. Se isso é desejado → ✅; se a intenção era forçar o valor da destination → ❌.
+- ⚠️ **Bug pré-existente NÃO introduzido pelo fix**, mas exposto: nas branches InApp, depois do `helper.set(...)`, o código ainda faz `searchParams.append('utm_campaign', req.params.campaignId)` (L1074 e L1239). Se o request chega com `?utm_campaign=Y` + path `/db/X`, a URL final tem `utm_campaign=Y&utm_campaign=X` (duplicata). Já era assim antes do fix; documentado abaixo.
 
-### BLOCKER — `morgan` síncrono no hot path
-- `src/app.ts:38` `app.use(morgan('[UTM REQUEST] :method :url'))` — formato custom, mas `morgan` escreve em `process.stdout` por request. Em alta RPS isso vira backpressure (write síncrono em pipe Docker stdout).
-- Recomendação: desligar morgan em prod no caminho de redirect (montar só em `/api`), ou trocar por pino com transport async. Para um redirect service, idealmente: nada de log por request.
+## Inventário de manipulação de UTMs no controller
 
-### HIGH — `console.log` em todo redirect path
-- `redirect-controller.ts:1013, 1021, 1024, 1044, 1048, 1098, 1120, 1145, 1150, 1252, 1256, 1281, 1286` — múltiplos `console.log` por request (RULE/INAPP/IFRAME/RANK/CLICK).
-- `console.log` é síncrono em TTYs e bufferizado em pipes; sob carga alta, drena event loop. O log de linha 1024 ainda faz `JSON.stringify(inAppRules.map(...))` toda vez que há `utm_campaign` na request, mesmo sem match → alocação grande no hot path.
-- Recomendação: substituir por pino em level `info`+ com sampling, ou remover. Pelo menos remover o `[DEBUG INAPP]` (1021) e o `JSON.stringify` (1024).
+| Localização | UTM afetado | Operação | Origem do valor | Branch |
+|---|---|---|---|---|
+| `redirect-controller.ts:915-921` | TODOS de `req.query` | helper `set` | request | helper (novo) |
+| `redirect-controller.ts:1053` | TODOS de `req.query` | `helper.set` via fwd | request | **Rule** (alterado pelo fix) |
+| `redirect-controller.ts:1071` | TODOS de `req.query` | `helper.set` via fwd | request | **InApp/redirect** (alterado pelo fix) |
+| `redirect-controller.ts:1074` | `utm_campaign` | `searchParams.append` | `req.params.campaignId` | **InApp/redirect** (intacto) |
+| `redirect-controller.ts:1182` | `utm_source` | `allParams.set` se ausente | DEFAULT `'redron'` | Hot path `redirect()` |
+| `redirect-controller.ts:1183` | `utm_medium` | `allParams.set` se ausente | DEFAULT `'broadcast'` | Hot path `redirect()` |
+| `redirect-controller.ts:1184-1186` | `utm_campaign` | `allParams.set` | **`req.query.broad`** | Hot path `redirect()` — REGRA DO BROAD |
+| `redirect-controller.ts:1187-1189` | `utm_campaign` | `allParams.set` se ausente | `linkId` ou `'direct'` | Hot path `redirect()` |
+| `redirect-controller.ts:1237` | TODOS de `req.query` | `helper.set` via fwd | request | **InApp/redirectByGroup** (alterado pelo fix) |
+| `redirect-controller.ts:1239` | `utm_campaign` | `searchParams.append` | `req.params.campaignId` | **InApp/redirectByGroup** (intacto) |
+| `redirect-controller.ts:1312` | `utm_source` | `allParams.set` se ausente | DEFAULT `'redron'` | Hot path `redirectByGroup()` |
+| `redirect-controller.ts:1313` | `utm_medium` | `allParams.set` se ausente | DEFAULT `'broadcast'` | Hot path `redirectByGroup()` |
+| `redirect-controller.ts:1314-1316` | `utm_campaign` | `allParams.set` | **`req.query.broad`** | Hot path `redirectByGroup()` — REGRA DO BROAD |
+| `redirect-controller.ts:1317-1319` | `utm_campaign` | `allParams.set` se ausente | `linkId` ou `'direct'` | Hot path `redirectByGroup()` |
 
-### HIGH — `compression` aplicado em redirects
-- `src/app.ts:42-45` aplica `compression({ level:6, threshold:1024 })` globalmente. Resposta `res.redirect()` tem body curto (<1KB), threshold protege do gzip propriamente dito, mas a middleware ainda intercepta `res.write/end` e instala listeners — overhead inútil em **toda** request 302.
-- Recomendação: montar `compression` apenas em `/api` (rotas que retornam JSON). Hot path nem deveria entrar nessa middleware.
+Também: condição de match de rules e in-app rules usa `req.query.*`:
+- `redirect-controller.ts:783-794` `matchRule(query, rules)` — compara `String(query[key] || '') === value` por entrada de `rule.conditions`.
+- `redirect-controller.ts:1063` `utmCampaign = (req.query.utm_campaign as string) || (req.params.campaignId as string)`.
+- `redirect-controller.ts:1066` `inAppRules.find(r => r.active && r.utm_campaign === utmCampaign)`.
 
-### HIGH — CORS/Helmet aplicados no hot path
-- `src/app.ts:21-31, 48-53` — `helmet({ csp })` e `cors({ origin:'*', credentials:true })` montados antes do redirect handler. Em 302 o header CSP é inútil (browser não renderiza). CORS preflight também não se aplica a um redirect navigational. Cada request paga setHeader e branch lookup à toa.
-- Recomendação: mover `helmet` e `cors` para `app.use('/api', ...)`. Hot path mantém só `trust proxy`, `disable etag`.
+Esses NÃO foram tocados pelo fix.
 
-### HIGH — `incrementClick` per-request → 2 round-trips Mongo por redirect
-- `redirect-controller.ts:1144` e `1148` (e 1280, 1284) fazem `findOneAndUpdate` upsert no Mongo a cada redirect (1x para `linkId`, 1x para `broad`). Fire-and-forget mascara latência percebida pelo cliente, mas pressiona Mongo e o pool de connections.
-- Em workload alto isso vira gargalo (lock collection-level, write concern). Também **reseta** o write concern por chamada — não há batching.
-- Recomendação: contador em Redis (`HINCRBY clicks:counters $linkId 1`), flusher cron 30s/60s consolidando para Mongo via `bulkWrite`. Reduz writes Mongo de 2×RPS para 2 a cada 30s.
+## Regra "broad → utm_campaign"
 
-### HIGH — Regex global em `getClickCountsBySuffixes`
-- `redirect-click-repository.ts:236-296` constrói `$or` de regex `_${suffix}$` por link_id. Sem índice ajudando (regex non-anchored from start = collection scan). Para 50 sufixos × N docs = full scan + reduce/split em pipeline.
-- Não é hot path direto (chamado em `/api/rank`), mas se o painel chamar com frequência, dói.
-- Recomendação: gravar o sufixo `domain_postId` como campo dedicado em `redirects_clicks` no momento do increment. Aí é `$match` com `$in` indexado. (Cross com Poseidon — owner do schema/index.)
+- **Localização exata**: `src/controllers/redirect-controller.ts:1184-1189` (em `redirect()`) e `:1314-1319` (em `redirectByGroup()`).
+- **Como funciona**:
+  ```ts
+  const broad = req.query.broad as string;
+  if (broad) {
+      allParams.set('utm_campaign', broad);  // sobrescreve qualquer utm_campaign existente
+  } else if (!allParams.has('utm_campaign')) {
+      allParams.set('utm_campaign', linkId || 'direct');
+  }
+  ```
+  Adicionalmente, `broad_clicks` é incrementado em Mongo (`:1198-1200`, `:1328-1330`).
+- **Antes do fix**: idêntico.
+- **Depois do fix**: **IDÊNTICO**. O fix não tocou nessas linhas.
+- **Caveat operacional**: a regra do broad SÓ executa quando NENHUMA Rule do Redis bate E NENHUMA InApp rule bate. Se um request chega com `?broad=X&utm_source=facebook` e existe uma Rule com `conditions: { utm_source: 'facebook' }`, a Rule branch (L1050) faz `res.redirect(...)` e retorna — o broad nunca vira utm_campaign nesse fluxo. **Era assim antes também**, não é regressão; só vale registrar para o usuário não atribuir esse comportamento ao fix.
+- **Status**: ✅ SAFE
 
-### MED — `invertedLangDomains` recriado por request
-- `redirect-controller.ts:1102` array literal `['appmobile4u.com', ...]` é alocado a cada `redirect()`.
-- Recomendação: declarar como `private static readonly INVERTED_LANG_DOMAINS = new Set([...])`. Lookup vira O(1) (`.has(url.hostname)`) e zero alocação por request.
+## Regra "do term"
 
-### MED — `new URL(redirectUrl)` mesmo quando não vai usar
-- `redirect-controller.ts:1103` faz parse completo de URL, mas `url` só é necessário para domínios em `invertedLangDomains` (linha 1107).
-- Recomendação: checar `INVERTED_LANG_DOMAINS.has(<hostname extraído por substring>)` ANTES e só instanciar `URL` se entrar na branch.
+- **Localização exata**: NÃO existe lógica especial de `utm_term` no código.
+  - `grep -rn "utm_term" src/` retorna **zero** matches.
+  - `utm_term` é tratado como qualquer query param: passa pelo `forwardQueryParams` (branches Rule/InApp) ou pelo loop `allParams.set(...)` (hot path L1176-1180 e L1306-1310).
+- **Como funciona (interpretação)**: a "regra do term" provavelmente é uma das três coisas:
+  1. Uma `Rule` no Redis com `conditions: { utm_term: 'X' }` — a rule só dispara quando o request tem `utm_term=X` (matching).
+  2. Uma `Rule` com `destination: 'https://x.com/?utm_term=hardcoded'` — força um `utm_term` específico no destino.
+  3. Uma `InAppRule` cuja `destination` tem `utm_term=...` hardcoded.
+- **Antes do fix**:
+  - (1) matching — funcionava normalmente; matching não foi tocado pelo fix.
+  - (2)/(3) com `passQueryParams: true`: request `?utm_term=req` → URL final = `?utm_term=hardcoded&utm_term=req` (DUPLICATA). Parser dependente.
+  - (2)/(3) com `passQueryParams: false`: request descartado, destination intacta com `utm_term=hardcoded`.
+- **Depois do fix**:
+  - (1) matching — IDÊNTICO. Match continua usando `req.query` direto (`:783-794`).
+  - (2)/(3) com `passQueryParams: true`: request `?utm_term=req` → URL final = `?utm_term=req` (SOBRESCREVE hardcoded).
+  - (2)/(3) com `passQueryParams: false`: IDÊNTICO.
+- **Status**: ⚠️ MUDANÇA DE COMPORTAMENTO em (2) e (3) com `passQueryParams: true`. Se o objetivo da regra era **forçar** `utm_term=hardcoded` ignorando o request, o fix agora deixa o request vencer.
 
-### MED — `URLSearchParams` + loop por request
-- `redirect-controller.ts:1123-1128, 1259-1264` — para cada redirect, itera `Object.entries(req.query)` e popula `URLSearchParams`. Express já parseia querystring; bastaria pegar `req.url.split('?')[1]` (ou guardar `originalUrl`) e concatenar, evitando double-parse.
-- Pequena otimização, mas em alto RPS soma.
+**VERIFICAR EM PRODUÇÃO**:
+```bash
+# Listar regras ativas e procurar UTMs hardcoded nas destinations
+redis-cli GET redirect:rules | jq '.[] | select(.active and .passQueryParams) | {id, description, conditions, destination}'
+redis-cli GET redirect:inapp_rules | jq '.[] | select(.active and .passQueryParams) | {id, description, utm_campaign, destination}'
 
-### MED — `redis.set('recent:<ip>', ..., 'EX', 5)` é dead code
-- `redirect-controller.ts:1156` (e 1292) escreve em Redis mas a chave **nunca é lida** em lugar nenhum do código. Comentário diz "anti-duplicação" mas não há `get` correspondente.
-- Recomendação: remover. Reduz 1 write Redis por redirect.
+# Filtrar só as que têm utm_ hardcoded na destination
+redis-cli GET redirect:rules | jq '.[] | select(.active and (.destination | test("utm_"))) | {id, description, destination}'
+redis-cli GET redirect:inapp_rules | jq '.[] | select(.active and (.destination | test("utm_"))) | {id, description, destination}'
+```
+Para cada match, confirmar com produto: a sobrescrita pelo request é desejada?
 
-### LOW — `req.path.includes('favicon') || req.url.includes('favicon')`
-- `redirect-controller.ts:997, 1172` — duplica check. `req.path` e `req.url` divergem só em querystring; `favicon` em querystring é improvável.
-- Recomendação: simplificar para `if (req.path.endsWith('/favicon.ico')) ...`.
+## Análise por cenário (A–F + G/H)
 
-### LOW — `getVisitorKey` aloca `Date` por request
-- `redirect-controller.ts:580` `new Date().getHours()` por chamada. Ok, mas em hot path: cachear hora atual num ticker (refresh cada minuto) elimina alocação.
+| Cenário | Antes do fix | Depois do fix | Regressão? |
+|---|---|---|---|
+| A: rule `passQueryParams=true`, destination sem utm hardcoded | `?utm_term=req` | `?utm_term=req` | NÃO |
+| B: rule `passQueryParams=true`, destination com `utm_term=hardcoded` | `?utm_term=hardcoded&utm_term=req` (duplicata, parser-dependente) | `?utm_term=req` (sobrescreve) | ⚠️ Mudança intencional; confirmar com produto |
+| C: rule `passQueryParams=false` | só destination, query descartada | IDÊNTICO | NÃO |
+| D: request `?utm_term=` (string vazia) | descartado (`if(value)` é falsy) | propagado como `utm_term=` literal | ⚠️ Bug fix intencional |
+| E: request `?utm_x=a&utm_x=b` (array) | `append a` + `append b` (duplicata na URL final) | `set b` (só o último) | ⚠️ Mudança; alinha com "valor mais recente vence". Improvável em tráfego real. |
+| F: request sem `utm_term` | utm_term ausente | utm_term ausente | NÃO |
+| **G: InApp `/db/X?utm_campaign=Y`** (path E query) | helper-append `utm_campaign=Y` + path-append `utm_campaign=X` = duplicata `Y&X` | helper-set `utm_campaign=Y` + path-append `utm_campaign=X` = duplicata `Y&X` | NÃO (mesma duplicata antes/depois) — **mas ver bug pré-existente abaixo** |
+| **H: InApp destination com `utm_campaign=destdefault&utm_term=destterm`, request `?utm_campaign=summer&utm_term=req`** | `utm_campaign=destdefault&utm_term=destterm&utm_campaign=summer&utm_term=req` (TODAS duplicadas) | `utm_campaign=summer&utm_term=req` (request vence) | ⚠️ Mudança significativa; mesma semântica do B |
 
-### LOW — `cluster.isWorker || cluster.worker?.id === 1`
-- `redirect-controller.ts:117` — lógica está invertida em intent: `!cluster.isWorker` em modo single-process é true, então cron roda. Em cluster, só worker 1 roda. OK funcionalmente mas combinado com BLOCKER de controller duplicado, vira 2 crons no worker 1.
+## Hunks do diff (commit a376a69)
 
----
+### Hunk 1: `forwardQueryParams` helper — L910-921
+- ✅ **SAFE**
+- Razão: helper isolado, puro, sem side effects. Lógica correta:
+  - Aceita string vazia (filtro `=== undefined || === null`).
+  - Array → último elemento (alinha com semântica Express/qs de "valor mais recente vence" em `?x=a&x=b`).
+  - `String(v)` converte qualquer tipo de forma estável.
+- Nit minor (não bloqueia): `Record<string, any>` é mais fraco que `ParsedQs` (o tipo real de `req.query`). Aceitável dado o escopo do fix, mas perde precisão de tipo. Não há regressão.
 
-## Middleware / app.ts
+### Hunk 2: Rule branch — L1050-1053
+- ⚠️ **MUDANÇA DOCUMENTADA**
+- Razão: substituiu `for…of req.query { if(value) append }` por `forwardQueryParams(ruleUrl, req.query)`. Dois efeitos combinados:
+  1. `append → set`: destination com UTM hardcoded é sobrescrita.
+  2. `if (value)` (truthy) → `if (value !== undefined && value !== null)`: string vazia agora propaga.
+- Era exatamente o objetivo do fix. Aprovado.
 
-### HIGH — Init pesado no startup
-- `src/app.ts:113-122` itera slugs e registra rota estática para cada um. OK.
-- `src/app.ts:128-152` catch-all `/:param` faz `domainGroupService.getActiveSlugs()` por request. `getActiveSlugs()` em `domain-group-service.ts:117-120` retorna `Array.from(this.cache.keys())` — **aloca novo array a cada chamada**. Em hot path com catch-all, isso é alocação em GC quente.
-- Recomendação: cachear `slugsArray` no service e invalidar quando `refreshCache()` rodar. Memoizar.
+### Hunk 3: InApp branch em `redirect()` — L1068-1075
+- ⚠️ **MUDANÇA DOCUMENTADA** + ⚠️ **ATENÇÃO ESPECIAL**:
+- Mesma análise do Hunk 2.
+- **Bug pré-existente exposto**: L1074 mantém `inAppUrl.searchParams.append('utm_campaign', String(req.params.campaignId))`. Sequência de execução:
+  1. helper percorre `req.query` e faz `set('utm_campaign', req.query.utm_campaign)` se presente.
+  2. Logo em seguida, `append('utm_campaign', req.params.campaignId)`.
+  3. Se ambos existem (`/db/X?utm_campaign=Y`), URL final tem **DOIS** `utm_campaign` (set escreveu Y, append adicionou X).
+- **Era assim antes** (`append + append`), então **não é regressão**. Mas o fix tornou mais visível porque a destination não está mais "consumindo" uma das duplicatas (cenário H).
+- Decisão de produto fora do escopo: trocar L1074 para `.set('utm_campaign', req.params.campaignId)` se path deve sobrescrever request, ou manter `append` se ambos devem aparecer no destino.
 
-### HIGH — Catch-all assíncrono mesmo com cache em memória
-- `src/app.ts:128-139` chama `getActiveSlugs().then(...)` — promise overhead por request. `ensureCache()` é async-on-first-call, depois sync, mas continua retornando Promise. Cada request paga microtask scheduling.
-- Recomendação: expor um `getActiveSlugsSync()` que retorna o array cacheado (já carregado no startup). Catch-all passa a ser síncrono.
+### Hunk 4: InApp branch em `redirectByGroup()` — L1234-1241
+- Mesma análise do Hunk 3, espelhada (`L1239` análogo a `L1074`).
 
-### MED — `app.use(express.json({ limit: '10mb' }))` e `urlencoded` global
-- `src/app.ts:56-57` montados antes das rotas de redirect (que não têm body). `express.json` no-op para GET por content-type, mas a middleware ainda entra na chain.
-- Recomendação: montar só em `/api`.
+## Riscos remanescentes
 
-### LOW — `app.set('etag', false)` ✓ correto para redirect
-- `src/app.ts:34` — bom. Etag é caro e inútil para 302.
+⚠️ **Risco 1 — destinations com UTMs hardcoded perdem precedência**
+Qualquer rule no Redis (Rule ou InAppRule) cuja `destination` foi escrita com `utm_X=valor_fixo` esperando que esse valor fosse preservado MESMO quando o request manda outro, agora se comporta diferente: o request vence. Severidade depende de quantas regras se encaixam neste padrão. **Mitigação: auditoria de Redis (ver Recomendações).**
 
-### LOW — `helmet` CSP com `*` em frameSrc
-- `src/app.ts:25` `frameSrc: ["'self'", "*"]` — security smell, mas é pra rota iframe (in-app). Não-perf, segue para Aegis.
+⚠️ **Risco 2 — `utm_campaign` duplicada no InApp branch (path + query)** (bug pré-existente, NÃO introduzido pelo fix)
+Se request chega com `/db/X?utm_campaign=Y`, URL final tem `utm_campaign=Y&utm_campaign=X`. PHP/WordPress lê o último (X = path vence); Java Servlet/alguns frameworks lêem o primeiro (Y = query vence). Comportamento ambíguo. **Fora do escopo deste fix**, mas registrar como tech debt.
 
----
+⚠️ **Risco 3 — comportamento de array agora pega último em vez de empilhar**
+Request com `?utm_term=a&utm_term=b`: antes ia ao destino como `utm_term=a&utm_term=b`, agora vai como `utm_term=b`. Improvável em tráfego real (geralmente só 1 utm_term), mas se algum dashboard espera múltiplos valores, mudou.
 
-## Services
+⚠️ **Risco 4 — string vazia agora propaga**
+Antes `?utm_term=` (vazio) era descartado. Agora chega ao destino como `utm_term=`. Impacto baixo (destino normalmente faz truthy check), mas registrar.
 
-### MED — `superfilter-service.ts` — sort triplo
-- `superfilter-service.ts:55-59` ordena `build` por revenue desc.
-- `superfilter-service.ts:73-77` ordena `processedData` por revenue desc.
-- `builder-service.ts:196-200` já adiciona `$sort` no pipeline Mongo.
-- Total: 3 sorts. Para N=50 items é negligenciável; para grandes payloads do `/api/process` cresce. Não é hot path.
-- Recomendação: remover sort 55-59 (vem ordenado de Mongo).
+✅ **Confirmado não-risco — hot path principal intacto**
+A regra `broad → utm_campaign` e os defaults `utm_source=redron` / `utm_medium=broadcast` ficam no hot path principal (`L1182-1189`, `L1312-1319`), que SÓ executa após ambos early-returns falharem. Conferido linha-a-linha; Athena não tocou.
 
-### MED — `builder-service.ts:203` — `JSON.stringify(pipeline, null, 2)` por execução
-- Não é hot path (cron 15 min), mas em request manual `/api/process` roda toda vez.
-- Recomendação: remover ou colocar atrás de `if (process.env.DEBUG)`.
+✅ **Confirmado não-risco — match de rules e in-app rules intacto**
+`matchRule()` em `L783-794` e o lookup de InApp em `L1066/L1232` continuam usando `req.query` direto. Match continua funcionando para regras com `conditions: { utm_term: 'X' }` etc.
 
-### MED — `process-service.ts:79-114` — múltiplos passes sobre `group`
-- `sumField` chamado 7x sobre o mesmo array → 7 `Array.reduce` separados. Para grupos pequenos OK. Para datasets grandes (raros aqui) pode ser unificado em 1 pass.
-- LOW para o uso atual (cron 15 min, ~50-200 itens).
+## Recomendações antes de merge
 
-### LOW — `pageview-service.ts:67-86` — batches sequenciais com `await`
-- Throttle de 3 concorrentes em loop sequencial é correto. Worst case 50 itens × 3s timeout = ~17 batches. ~17s por cron. Aceitável (cron a cada 15 min).
-- Recomendação: trocar por `p-limit` com pool persistente (overlap entre batches melhora wall-time).
+- [ ] **Auditar Redis em produção** — listar regras ativas com `passQueryParams: true` e destinations com UTMs hardcoded:
+  ```bash
+  # Rules
+  redis-cli GET redirect:rules | jq '.[] | select(.active and .passQueryParams and (.destination | test("utm_"))) | {id, description, conditions, destination}'
 
-### MED — `domain-group-service.ts:117, 125` — alocação por chamada
-- `getActiveSlugs()` e `getAllDomains()` retornam novo array via `Array.from`. No catch-all, chamado per request.
-- Recomendação: memoizar array cacheado, invalidar em `refreshCache()`.
+  # In-app rules
+  redis-cli GET redirect:inapp_rules | jq '.[] | select(.active and .passQueryParams and (.destination | test("utm_"))) | {id, description, utm_campaign, destination}'
+  ```
+  Para cada match, validar com produto se sobrescrita pelo request é o comportamento desejado. Se algum hardcoded era "forçado" propositalmente, decidir entre: (a) mudar destination para não ter o hardcoded, (b) flag adicional na rule (`overrideQueryParams: false` por chave), (c) reverter o fix em casos específicos.
 
----
+- [ ] **Validação manual em staging** (com `DEBUG_REDIRECT=1`):
+  ```bash
+  # Cenário A — fluxo normal (sem rule match), broad vira utm_campaign
+  curl -sI 'https://staging.../?broad=summerX&utm_term=adset-42' | grep -i location
+  # Esperado: utm_campaign=summerX, utm_term=adset-42
 
-## Repositories
+  # Cenário B — Rule passQueryParams=true (usar condições reais de uma rule existente)
+  curl -sI 'https://staging.../?utm_source=facebook&utm_term=adset-42' | grep -i location
+  # Esperado: utm_term=adset-42 chega; sem duplicata mesmo se destination tem utm_term
 
-### HIGH — `redirect-click-repository.ts:209-227` — `incrementMultipleClicks` é N+1
-- Loop com `await collection.updateOne(...)` sequencial. Para N linkIds, N round-trips.
-- Recomendação: `collection.bulkWrite([{ updateOne: ... }, ...], { ordered:false })`. 1 round-trip.
+  # Cenário C — Rule passQueryParams=false
+  curl -sI 'https://staging.../?<conditions>&utm_term=adset-42' | grep -i location
+  # Esperado: utm_term NÃO chega (passQueryParams false descarta tudo)
 
-### HIGH — `redirect-click-repository.ts:236-296` — pipeline pesado
-- Já citado em hot path. Resumindo: `$or` de regex sem âncora inicial → collection scan; `$let`/`$reduce`/`$split` por doc → CPU Mongo.
-- Recomendação (Poseidon): adicionar campo `suffix` indexado, gravar no momento do increment.
+  # Cenário D — InApp /db/campaign com utm_term no query
+  curl -sI 'https://staging.../db/summer-promo?utm_term=adset-42' | grep -i location
+  # Esperado: utm_campaign=summer-promo (do path), utm_term=adset-42
 
-### LOW — `broad-click-repository.ts:18` — `new Date().toISOString().split('T')[0]` por click
-- Aloca Date + string split a cada increment. `today` poderia ser cacheado (refresh à meia-noite) por instância — mas com fire-and-forget e várias instâncias, pouco ganho.
+  # Cenário E — string vazia (regressão controlada)
+  curl -sI 'https://staging.../?utm_term=&broad=X' | grep -i location
+  # Esperado: utm_term= aparece literal
 
-### LOW — `redirect-link-repository.ts` — sem `projection`
-- `getAllLinks`, `getLinksByDomain` retornam doc completo. Não são hot path. OK.
+  # Cenário F — array (raro)
+  curl -sI 'https://staging.../?utm_term=a&utm_term=b' | grep -i location
+  # Esperado: utm_term=b (último)
 
-### LOW — `domain-group-repository.ts:9-18` — `ensureIndexes()` chamado no constructor sem `await`
-- Fire-and-forget. Mongo handle dedupe, mas error silencioso. Não-perf.
+  # Cenário G — duplicata path+query (bug pré-existente)
+  curl -sI 'https://staging.../db/X?utm_campaign=Y&utm_term=t' | grep -i location
+  # Esperado: utm_campaign=Y&utm_term=t&utm_campaign=X — confirmar que era assim antes também
+  ```
 
----
+- [ ] **Habilitar `DEBUG_REDIRECT=1`** em uma janela curta de produção pós-deploy e validar nos logs:
+  - `[RULE REDIRECT]` mostra URLs com `utm_term=...` presente quando esperado.
+  - `[INAPP REDIRECT]` mostra URLs sem duplicatas de destination.
 
-## Outros (cron, config, error-handler)
+- [ ] **Confirmar que nenhuma rule depende de "force destination utm"** — pergunta direta ao stakeholder de produto antes do merge.
 
-### MED — `config/redis.ts:3-12` sem `lazyConnect`, sem TLS, sem keepAlive
-- `ioredis` default cria conexão imediata. OK para serviço always-on.
-- `retryStrategy` 50ms*N até 2s — agressivo no boot, OK em runtime.
-- Sem `enableOfflineQueue: false` — durante reconnect comandos enfileiram em memória → memória vaza se Redis ficar fora muito tempo.
-- Recomendação: setar `enableOfflineQueue: false` + `maxRetriesPerRequest: 1` para hot path. Falha rápido, evita queue infinita.
+- [ ] (Tech debt, fora do escopo) Decidir se `L1074` e `L1239` (path → utm_campaign via `append`) deveriam virar `set`. Documentar decisão.
 
-### MED — `config/database.ts:3-11` — sem pool config, sem `maxPoolSize`
-- `MongoClient.connect(url)` usa defaults (pool 100). Para redirect com cluster N workers, total conexões = N*100. Pode estourar Mongo em cluster grande.
-- Recomendação: setar `maxPoolSize` explicitamente. Para cluster `os.cpus()`, considerar `maxPoolSize: 20` por worker.
+## Arquivos lidos
 
-### LOW — `config/cluster.ts:1-43` — fork básico, sem graceful shutdown
-- OK para perf. Não-perf: `cluster.fork()` no `exit` sem backoff pode loop em crash. Não é Hera.
+- `src/controllers/redirect-controller.ts` — L35-115 (interfaces, constantes), L780-840 (matchRule, createRule), L900-1000 (helper, InApp CRUD), L1020-1340 (redirect, redirectByGroup, ambas as branches Rule/InApp e hot paths)
+- `src/repositories/broad-click-repository.ts` — entendimento da regra do broad
+- `src/routes/redirect-route.ts:42-43` — rota de broad-clicks
+- `src/interfaces/broad-click-interface.ts` — shape do contador
+- `docs/openapi.yaml:14-60, 880-1124` — spec confirma comportamento esperado de Rule/InApp e da regra do broad
+- `scratchpad/agent-athena.md` — relatório do fix
+- `scratchpad/agent-odysseus.md` — investigação original
+- `git diff` (commit `a376a69`) — diff completo do fix
+- `git log -p --all -S "forwardQueryParams"` — confirmação do commit que introduziu o helper
 
-### MED — `middleware/error-handler.ts:10-13` — `console.error` com stack completo
-- Não é hot path em sucesso, mas se um path quente começar a errar, stack trace é caro.
-- Recomendação: trocar por logger estruturado (pino), ou usar `err.message` em prod sem stack.
+## Notas finais
 
-### HIGH — Cron e requests competem no mesmo worker
-- `redirect-controller.ts:117-121` — cron só roda no worker 1 (correto). Mas worker 1 também recebe requests do redirect (load balancer Node nivela). Durante a execução do cron (`fetchAllValidPosts` em paralelo, pageviews em batches), worker 1 fica com event loop ocupado por seg/dezenas-de-seg → TTFB de redirects no worker 1 sobe.
-- Recomendação: rodar cron em **processo dedicado** (cluster workerType=cron, sem listen), ou em outro container. Worker que serve redirect não deve fazer cron.
-
----
-
-## Top 5 quick wins (impacto/esforço)
-
-1. **Remover instanciação duplicada de `RedirectController`** — editar `routes/redirect-route.ts` para receber `controller` injetado em vez de criar dentro. **1 linha.** Resolve cron duplo, dobra cache hit rate, remove 50% das chamadas WP-VALIDATE.
-2. **Mover `helmet`/`cors`/`compression`/`json`/`urlencoded` para `app.use('/api', ...)`** — hot path passa a ter só `trust proxy` + handler. **5 linhas.** Reduz overhead de middleware por redirect.
-3. **Remover `morgan` no hot path + remover `console.log` mais frequentes (`[DEBUG INAPP]` linha 1021/1024, `[CLICK RECORDED ...]` linhas 1145/1150/1281/1286)**. **~10 linhas.** Reduz I/O sync no event loop.
-4. **`invertedLangDomains` virar `static readonly Set` + skip `new URL()` quando hostname não está no set.** **5 linhas.** Reduz alocação por request.
-5. **Memoizar `getActiveSlugs()` no `DomainGroupService` (cachear array, invalidar em `refreshCache`).** Tornar `getActiveSlugs()` sync. Catch-all em `app.ts` deixa de pagar microtask. **10 linhas.** Hot path puramente síncrono no fast-path.
-
-Bônus 6 (esforço maior, alto impacto): batching de `incrementClick` via Redis HINCRBY + flusher cron → corta 2 writes Mongo por redirect.
-
----
-
-## Riscos para validar com benchmark
-
-- Confirmar que **remover `morgan`** corta TTFB p99 — bench com `wrk -t8 -c500 -d30s http://localhost:3000/?utm_source=x`.
-- Antes/depois de **deduplicar controller** olhar logs `[CRON]` — esperado: aparecer só 1 vez por boot do worker 1, não 2.
-- Medir taxa de hit do `bestLinksMapCaches` antes/depois (instrumentar contador). Esperado: hit rate >95% após dedup.
-- Pool Mongo: ver `db.serverStatus().connections` antes/depois do `maxPoolSize` explícito. Não deve degradar throughput.
-- Validar que `enableOfflineQueue: false` no Redis não quebra nada em deploy (Redis restart) — pode ser preciso adicionar guard `try/catch` em chamadas no hot path.
-- `compression` removido do redirect: confirmar que `/api/*` continua respondendo gzip (essas rotas devolvem JSON grande em `/api/rank-by-domain`).
+Local Redis (`redis-cli GET redirect:rules` e `redirect:inapp_rules`) retornou `nil` — rules vivem apenas em produção, então a auditoria empírica (item 1 das recomendações) precisa ser feita lá. Sem acesso ao Redis produtivo daqui, não posso confirmar 100% se há rules com UTMs hardcoded — apenas mapear o impacto teórico caso existam.

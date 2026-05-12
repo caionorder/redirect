@@ -1,108 +1,130 @@
 Você é Athena (Frontend Senior Developer). Trabalhe em /Users/caionorder/Dev/redirect.
 
-# Contexto do projeto
+# Contexto
 
-Serviço Node.js/TypeScript de redirecionamento (Express + Mongo + Redis) que propaga UTMs para destinos finais. Hot path em src/controllers/redirect-controller.ts. Você já tocou neste projeto antes (cache-control, routing-fix, perf-impl — ver memórias Obsidian em ~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Caio Norder/PROJECTS/redirect/).
+Projeto Node.js/TypeScript de redirecionamento. Há lógica que detecta `?language=en|es|...` e prefixa o pathname do destino com `/en`, `/es`, etc para uma whitelist de domínios em `INVERTED_LANG_DOMAINS`. O usuário quer **desativar essa lógica** mantendo o código comentado (decisão tomada pelo usuário: opção "Comentar bloco" — reversível em segundos).
 
-# Findings (do Odysseus — investigação prévia)
+# Tarefa — DESATIVAÇÃO MÍNIMA
 
-Relatório completo em scratchpad/agent-odysseus.md. Resumo:
+Risco: **MÉDIO** (hot path em produção). Mudança puramente cosmética/de comportamento — sem refactor.
 
-O utm_term é preservado corretamente no path principal (L1166-1183 e L1298-1315), MAS é perdido nos 3 branches de Rule/InApp Rule porque:
+## O que comentar
 
-1. Usam `if (value)` (truthy check) em vez de `if (value !== undefined && value !== null)` — derruba string vazia.
-2. Usam `searchParams.append(...)` em vez de `.set(...)` — se a destination já tem `utm_term=...` hardcoded, cria duplicata e parsers que pegam o PRIMEIRO valor (Java Servlet, alguns frameworks) retornam o hardcoded.
-3. `passQueryParams: false` (config no Redis) hoje descarta TUDO.
+Arquivo: `src/controllers/redirect-controller.ts`
 
-Branches afetados:
-- `src/controllers/redirect-controller.ts:1037-1048` — Rule branch
-- `src/controllers/redirect-controller.ts:1057-1083` — InApp branch em redirect()
-- `src/controllers/redirect-controller.ts:1224-1248` — InApp branch em redirectByGroup()
+1. **L1141-1166** — Bloco completo de inversão de idioma:
+   ```ts
+   // Domínios com lógica invertida de idioma (APENAS estes recebem prefixo).
+   // Fast-path: extrair hostname por substring e checar Set antes de pagar new URL().
+   const hostStart = redirectUrl.indexOf('//');
+   let hostname = '';
+   if (hostStart !== -1) {
+       const afterScheme = redirectUrl.slice(hostStart + 2);
+       const pathStart = afterScheme.indexOf('/');
+       hostname = pathStart === -1 ? afterScheme : afterScheme.slice(0, pathStart);
+       const qIdx = hostname.indexOf('?');
+       if (qIdx !== -1) hostname = hostname.slice(0, qIdx);
+       hostname = hostname.toLowerCase();
+   }
+   const isInvertedDomain = RedirectController.INVERTED_LANG_DOMAINS.has(hostname);
 
-# Task — FIX
+   // Só adiciona prefixo de idioma nos domínios invertidos — todos os outros vão direto
+   if (isInvertedDomain) {
+       const url = new URL(redirectUrl);
+       if (!language || language === 'en') {
+           url.pathname = `/en${url.pathname}`;
+           redirectUrl = url.toString();
+       } else if (language !== 'pt') {
+           url.pathname = `/${language}${url.pathname}`;
+           redirectUrl = url.toString();
+       }
+       // Se language=pt, nao adiciona nada (acesso direto)
+   }
+   ```
 
-Risco: **MÉDIO** (hot path de redirect em produção). Aplicar o fix MÍNIMO:
+   Envolver em bloco de comentário `/* ... */` com nota no topo:
+   ```
+   /*
+    * [DESATIVADO 2026-05-12] Inversão de idioma desligada por solicitação do produto.
+    * Para reativar: descomentar este bloco. Toda request passa direto ao redirectUrl sem prefixo.
+    */
+   ```
 
-## 1. Criar helper privado na classe RedirectController
+2. **L1168-1172** — O log de debug `[${logType}]${langInfo}` referencia `isInvertedDomain` e `language`:
+   ```ts
+   if (RedirectController.DEBUG_REDIRECT) {
+       const langInfo = isInvertedDomain ? (language ? ` [${language.toUpperCase()}]` : ' [EN]') : '';
+       console.log(`[${logType}]${langInfo} ${domain} -> ${redirectUrl}`);
+   }
+   ```
+   Como `isInvertedDomain` deixa de existir, o tsc vai quebrar. Simplificar o log para:
+   ```ts
+   if (RedirectController.DEBUG_REDIRECT) {
+       console.log(`[${logType}] ${domain} -> ${redirectUrl}`);
+   }
+   ```
+   Comentar a versão original no MESMO bloco /* */ acima, ou inline:
+   ```ts
+   // [DESATIVADO 2026-05-12] log de idioma removido junto com a inversão
+   ```
 
-```ts
-private forwardQueryParams(targetUrl: URL, query: Record<string, any>): void {
-    for (const [key, value] of Object.entries(query)) {
-        if (value === undefined || value === null) continue;
-        const v = Array.isArray(value) ? value[value.length - 1] : value;
-        targetUrl.searchParams.set(key, String(v));
-    }
-}
-```
+3. **L1100** — `const language = req.query.language as string;` agora fica unused. Se tsc reclamar (`noUnusedLocals`), prefixar com underscore: `const _language = req.query.language as string;` ou comentar a linha também.
+   - **Verificar primeiro**: rode `npx tsc --noEmit` ANTES de tocar nessa linha. Se passar, deixa como está. Se reclamar, prefixe com `_` ou comente.
 
-Coloque o helper junto dos outros métodos privados utilitários da classe (procure por `private` no arquivo e ache lugar coerente — provavelmente perto de `generateIframeHtml` ou similar). Mantenha o estilo do código existente (acessores, types, indentação).
+4. **L107-114** — `INVERTED_LANG_DOMAINS` const fica unused. Mesmo critério: rode tsc primeiro; se quebrar, comente o bloco inteiro com nota:
+   ```ts
+   // [DESATIVADO 2026-05-12] Whitelist mantida para referência caso a inversão seja reativada.
+   // private static readonly INVERTED_LANG_DOMAINS = new Set<string>([
+   //     'appmobile4u.com',
+   //     ...
+   // ]);
+   ```
 
-## 2. Substituir os 3 trechos `for…of` por chamada ao helper
+## NÃO faça
 
-Branch 1 — Rule (L1037-1048):
-```ts
-- if (matchedRule.passQueryParams) {
--     for (const [key, value] of Object.entries(req.query)) {
--         if (value) ruleUrl.searchParams.append(key, String(value));
--     }
-- }
-+ if (matchedRule.passQueryParams) {
-+     this.forwardQueryParams(ruleUrl, req.query as Record<string, any>);
-+ }
-```
+- NÃO refatore.
+- NÃO mude o hot path principal de UTMs (fix recente da Athena anterior).
+- NÃO toque em `redirectByGroup()` (não tem essa lógica lá).
+- NÃO crie testes (regra global: só com pedido explícito).
+- NÃO faça commit.
+- NÃO rode o servidor.
 
-Branch 2 — InApp em redirect() (L1057-1083): mesma substituição. Atenção: depois do for…of, tem o `if (req.params.campaignId) inAppUrl.searchParams.append('utm_campaign', ...)`. **Manter esse append como está** — é semântica diferente (parametro de path vira utm_campaign). NÃO trocar por set aqui pra não quebrar comportamento de hoje. Apenas substituir o loop genérico.
+## Validação
 
-Branch 3 — InApp em redirectByGroup() (L1224-1248): mesmo padrão do Branch 2.
-
-## 3. NÃO altere
-
-- O hot path principal (L1166-1183 e L1298-1315) — já está correto.
-- A semântica de `passQueryParams: false` (não tem que virar whitelist agora — fora de escopo, é decisão de produto).
-- A lógica de iframe.
-- Nada além dos 3 trechos.
-- Não adicione testes (regra global: testes só quando explicitamente pedido).
-
-## 4. Validação
-
-- Após editar, rode `npx tsc --noEmit` (ou o script de typecheck do package.json — confira o `scripts` antes) pra garantir que não quebrou tipos.
-- Rode também o `lint` se houver script (`npm run lint`), só pra confirmar.
-- NÃO rode o servidor. NÃO faça commit.
+- Após editar, rode `npx tsc --noEmit`. Precisa retornar 0 erros.
+- Verifique que o redirect ainda funciona sintaticamente (sem rodar — só lendo).
 
 # Entregáveis obrigatórios
 
-1. Aplicar as 3 substituições + helper.
-2. Confirmar build (`tsc --noEmit`) limpo.
-3. Salvar em `scratchpad/agent-athena.md`:
+1. Aplicar a desativação acima.
+2. tsc clean.
+3. Salvar `scratchpad/agent-athena.md`:
 
 ```
-# Fix utm_term — Athena
+# Desativação inversão de idioma — Athena
 
 ## Mudanças aplicadas
-- src/controllers/redirect-controller.ts:LL — adicionado helper forwardQueryParams
-- src/controllers/redirect-controller.ts:LL — Rule branch substituído
-- src/controllers/redirect-controller.ts:LL — InApp branch (redirect) substituído
-- src/controllers/redirect-controller.ts:LL — InApp branch (redirectByGroup) substituído
+- src/controllers/redirect-controller.ts:LL — bloco de inversão comentado
+- src/controllers/redirect-controller.ts:LL — log simplificado
+- src/controllers/redirect-controller.ts:LL — (se aplicável) language / INVERTED_LANG_DOMAINS comentados
 
 ## Diff resumo
-<3 hunks com 5 linhas de contexto cada>
+<hunks>
 
 ## Typecheck
-<output de tsc --noEmit, idealmente "0 errors">
+<output de tsc --noEmit>
+
+## Como reativar
+<1 frase: "descomentar bloco em L... e restaurar log original">
 
 ## Notas
-<qualquer surpresa, desvio ou decisão tomada>
-
-## Próximos passos sugeridos
-- Code review por Hera antes de merge
-- Verificar regras no Redis (`passQueryParams`, `destination` com utm hardcoded)
-- Setar `DEBUG_REDIRECT=1` em staging pra confirmar branches batendo
+<surpresas/decisões>
 ```
 
-4. Criar memória Obsidian em `~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Caio Norder/PROJECTS/redirect/2026-05-12_HH-MM_fix-utm-term-rule-branches-athena.md` com YAML frontmatter (date, project: redirect, agent: athena, type: implementation, tags) + corpo descrevendo o fix.
+4. Criar memória Obsidian em `~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Caio Norder/PROJECTS/redirect/2026-05-12_HH-MM_disable-lang-inversion-athena.md` com YAML frontmatter (date, project: redirect, agent: athena, type: implementation, tags: [redirect, language, deactivation]) + corpo descrevendo a mudança e como reativar.
 
 # Passo final OBRIGATÓRIO
 
-Depois de salvar scratchpad/agent-athena.md E a memória Obsidian, rode EXATAMENTE este comando (literal):
+Depois de salvar scratchpad/agent-athena.md E a memória Obsidian, rode EXATAMENTE:
 
-cmux wait-for --signal done-athena-utmterm-fix-1747000000
+cmux wait-for --signal done-athena-lang-disable-1747000200
