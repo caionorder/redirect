@@ -908,6 +908,19 @@ export class RedirectController {
     }
 
     /**
+     * Repassa query params para uma URL de destino preservando string vazia e
+     * sobrescrevendo (set) ao invés de duplicar (append) para evitar colisão
+     * com params hardcoded no destination.
+     */
+    private forwardQueryParams(targetUrl: URL, query: Record<string, any>): void {
+        for (const [key, value] of Object.entries(query)) {
+            if (value === undefined || value === null) continue;
+            const v = Array.isArray(value) ? value[value.length - 1] : value;
+            targetUrl.searchParams.set(key, String(v));
+        }
+    }
+
+    /**
      * Obtem as regras de in-app do cache (com cache em memória)
      */
     private async getInAppRules(): Promise<InAppRule[]> {
@@ -1037,9 +1050,7 @@ export class RedirectController {
             if (matchedRule) {
                 const ruleUrl = new URL(matchedRule.destination);
                 if (matchedRule.passQueryParams) {
-                    for (const [key, value] of Object.entries(req.query)) {
-                        if (value) ruleUrl.searchParams.append(key, String(value));
-                    }
+                    this.forwardQueryParams(ruleUrl, req.query as Record<string, any>);
                 }
                 if (RedirectController.DEBUG_REDIRECT) console.log(`[RULE REDIRECT] ${matchedRule.id} (${matchedRule.description}) -> ${ruleUrl.toString()}`);
                 res.setHeader('Cache-Control', 'private, no-store');
@@ -1057,9 +1068,7 @@ export class RedirectController {
                 if (inAppMatch) {
                     const inAppUrl = new URL(inAppMatch.destination);
                     if (inAppMatch.passQueryParams) {
-                        for (const [key, value] of Object.entries(req.query)) {
-                            if (value) inAppUrl.searchParams.append(key, String(value));
-                        }
+                        this.forwardQueryParams(inAppUrl, req.query as Record<string, any>);
                         // Se veio do path, adicionar como utm_campaign
                         if (req.params.campaignId) {
                             inAppUrl.searchParams.append('utm_campaign', String(req.params.campaignId));
@@ -1225,9 +1234,7 @@ export class RedirectController {
                 if (inAppMatch) {
                     const inAppUrl = new URL(inAppMatch.destination);
                     if (inAppMatch.passQueryParams) {
-                        for (const [key, value] of Object.entries(req.query)) {
-                            if (value) inAppUrl.searchParams.append(key, String(value));
-                        }
+                        this.forwardQueryParams(inAppUrl, req.query as Record<string, any>);
                         if (req.params.campaignId) {
                             inAppUrl.searchParams.append('utm_campaign', String(req.params.campaignId));
                         }
