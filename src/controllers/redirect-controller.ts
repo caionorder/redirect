@@ -1138,37 +1138,42 @@ export class RedirectController {
                 if (RedirectController.DEBUG_REDIRECT) console.log(`[DEBUG] ranking global está VAZIO - rode /api/process para popular`);
             }
 
-            // Domínios com lógica invertida de idioma (APENAS estes recebem prefixo).
-            // Fast-path: extrair hostname por substring e checar Set antes de pagar new URL().
-            const hostStart = redirectUrl.indexOf('//');
-            let hostname = '';
-            if (hostStart !== -1) {
-                const afterScheme = redirectUrl.slice(hostStart + 2);
-                const pathStart = afterScheme.indexOf('/');
-                hostname = pathStart === -1 ? afterScheme : afterScheme.slice(0, pathStart);
-                const qIdx = hostname.indexOf('?');
-                if (qIdx !== -1) hostname = hostname.slice(0, qIdx);
-                hostname = hostname.toLowerCase();
-            }
-            const isInvertedDomain = RedirectController.INVERTED_LANG_DOMAINS.has(hostname);
+            /*
+             * [DESATIVADO 2026-05-12] Inversão de idioma desligada por solicitação do produto.
+             * Para reativar: descomentar este bloco (inclusive o log com langInfo abaixo).
+             * Toda request passa direto ao redirectUrl sem prefixo de idioma.
+             *
+             * // Domínios com lógica invertida de idioma (APENAS estes recebem prefixo).
+             * // Fast-path: extrair hostname por substring e checar Set antes de pagar new URL().
+             * const hostStart = redirectUrl.indexOf('//');
+             * let hostname = '';
+             * if (hostStart !== -1) {
+             *     const afterScheme = redirectUrl.slice(hostStart + 2);
+             *     const pathStart = afterScheme.indexOf('/');
+             *     hostname = pathStart === -1 ? afterScheme : afterScheme.slice(0, pathStart);
+             *     const qIdx = hostname.indexOf('?');
+             *     if (qIdx !== -1) hostname = hostname.slice(0, qIdx);
+             *     hostname = hostname.toLowerCase();
+             * }
+             * const isInvertedDomain = RedirectController.INVERTED_LANG_DOMAINS.has(hostname);
+             *
+             * // Só adiciona prefixo de idioma nos domínios invertidos — todos os outros vão direto
+             * if (isInvertedDomain) {
+             *     const url = new URL(redirectUrl);
+             *     if (!language || language === 'en') {
+             *         url.pathname = `/en${url.pathname}`;
+             *         redirectUrl = url.toString();
+             *     } else if (language !== 'pt') {
+             *         url.pathname = `/${language}${url.pathname}`;
+             *         redirectUrl = url.toString();
+             *     }
+             *     // Se language=pt, nao adiciona nada (acesso direto)
+             * }
+             */
 
-            // Só adiciona prefixo de idioma nos domínios invertidos — todos os outros vão direto
-            if (isInvertedDomain) {
-                const url = new URL(redirectUrl);
-                if (!language || language === 'en') {
-                    url.pathname = `/en${url.pathname}`;
-                    redirectUrl = url.toString();
-                } else if (language !== 'pt') {
-                    url.pathname = `/${language}${url.pathname}`;
-                    redirectUrl = url.toString();
-                }
-                // Se language=pt, nao adiciona nada (acesso direto)
-            }
-
-            // Log com informacao de idioma e dominio (gated por DEBUG_REDIRECT)
+            // [DESATIVADO 2026-05-12] log de idioma removido junto com a inversão
             if (RedirectController.DEBUG_REDIRECT) {
-                const langInfo = isInvertedDomain ? (language ? ` [${language.toUpperCase()}]` : ' [EN]') : '';
-                console.log(`[${logType}]${langInfo} ${domain} -> ${redirectUrl}`);
+                console.log(`[${logType}] ${domain} -> ${redirectUrl}`);
             }
 
             // Repassa TODOS os query params recebidos, com defaults para UTMs
