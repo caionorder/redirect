@@ -456,6 +456,9 @@ export class RedirectController {
      * Domínios com entrada dentro do TTL reaproveitam o cache; os demais (ausentes ou expirados)
      * são buscados via API. Os resultados são sempre mesclados no cache por domínio (nunca
      * substituem o mapa inteiro), preservando entradas de domínios de outros grupos.
+     * Uma falha sem fallback disponível NÃO é persistida no cache — ficaria pinada por
+     * `VALID_POSTS_CACHE_TTL_MS` como se fosse uma entrada boa; deixando o domínio de fora, ele
+     * volta a `missingDomains` e é re-tentado já no próximo ciclo do cron.
      * Quando um domínio reaproveita o mesmo resultado de tentativas anteriores por falhas
      * consecutivas da API (fallback), a contagem é registrada na entrada do cache; a partir da
      * 2ª renovação seguida em fallback, emite `console.warn` com a idade estimada dos dados.
@@ -476,10 +479,22 @@ export class RedirectController {
             const fetched = await this.fetchDomainsFromApi(missingDomains, this.validPostsCache);
             for (const [domain, fetchResult] of fetched) {
                 const previousEntry = this.validPostsCache.get(domain);
+                const isFallbackReuse = previousEntry !== undefined && previousEntry.result === fetchResult;
+
+                if (!fetchResult.success && !isFallbackReuse) {
+                    // Falha sem fallback disponível — não persistir com fetchedAt "fresco". Deixando
+                    // o domínio fora do cache, ele volta a aparecer em missingDomains no próximo
+                    // ciclo do cron (15 min) e é re-tentado, em vez de ficar pinado por
+                    // VALID_POSTS_CACHE_TTL_MS (60 min) como se fosse uma entrada boa. O link deste
+                    // domínio ainda é removido NESTE ciclo: `validateRanking` trata "ausente do mapa"
+                    // e "presente com success:false" de forma idêntica.
+                    continue;
+                }
+
                 let consecutiveFallbacks = 0;
 
                 // Reaproveitou o mesmo objeto do cache anterior (fallback-por-falha) — escalar contagem
-                if (previousEntry && previousEntry.result === fetchResult) {
+                if (isFallbackReuse && previousEntry) {
                     consecutiveFallbacks = previousEntry.consecutiveFallbacks + 1;
                     if (consecutiveFallbacks >= 2) {
                         const staleHours = (consecutiveFallbacks * this.VALID_POSTS_CACHE_TTL_MS) / 3600000;

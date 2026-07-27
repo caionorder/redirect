@@ -359,3 +359,81 @@ Reconhecimento honesto da probabilidade: baixa. Corpo HTML (interstitial de WAF/
 
 I3 (falha pinada por 60 min) e M5 (invariante de referência) são os que eu pegaria primeiro. Seguem também: M6, os nits acima, BX5 (cache sem poda), BX6 (sem single-flight) e I1/M3 (ruído de eCPM de baixa amostra no piso de 100 impressões — decisão de produto já aprovada, monitorar as impressões do link nº 1 de cada domínio depois da primeira passada do cron).
 
+---
+
+# Round 6 — fix do I3
+
+**Escopo:** diff incremental vs HEAD `8d7c3d3` (rounds 3-5 já commitados) — 16+/1- em `src/controllers/redirect-controller.ts`.
+
+## Veredito: **APROVADO**
+
+O fix é mínimo, faz exatamente o que foi recomendado e está correto nos quatro caminhos. Só findings LOW abaixo, e o débito em aberto é o mesmo do round 5 — nada novo introduzido.
+
+## I3 — RESOLVIDO
+
+`:484-494` (guard) e `:479-505` (loop de gravação).
+
+Simulação do comportamento novo (cache frio, WP quebrado até t=45, saudável a partir de t=46):
+
+```
+t=0   FETCH falhou → NÃO persistido (retry no próx. ciclo) | ausente → removedByFailure
+t=15  FETCH falhou → NÃO persistido                        | ausente → removedByFailure
+t=30  FETCH falhou → NÃO persistido                        | ausente → removedByFailure
+t=45  FETCH falhou → NÃO persistido                        | ausente → removedByFailure
+t=60  FETCH ok → persistido                                | links ok
+t=75  sem fetch (entrada fresca)                           | links ok
+```
+
+O domínio volta a `missingDomains` a cada ciclo e se recupera no primeiro cron saudável, em vez de ficar pinado 60 min. O cenário do round 5 (recuperação 1 min após o boot custando uma hora de `/random`) está fechado.
+
+## Q1 — a equivalência do Map retornado é real
+
+`fetchAllValidPosts` tem **um único consumidor**: `validateRanking:585` (confirmado por grep em `src/`; nenhum outro caminho lê `validPostsCache` fora dos próprios métodos do cache). Lá, `!result` e `!result.success` caem no mesmo par de linhas (`removedByFailure++; return false;`), então ausente e presente-falho são de fato indistinguíveis para o serving. Equivalência confirmada.
+
+## Q2 — os quatro caminhos, e uma correção à hipótese do round
+
+Todos corretos:
+
+| caminho | `success` | `isFallbackReuse` | resultado |
+|---|---|---|---|
+| fetch novo com sucesso | true | false | persiste, contador zera ✓ |
+| fallback reuse | true | true | persiste, contador incrementa, warn ≥2 ✓ |
+| falha sem fallback | false | false | `continue`, não persiste, retry em 15 min ✓ |
+| falha com entrada boa **expirada** | true | true | fallback normal — a expiração não importa, `fallbackCache` é o cache inteiro ✓ |
+
+**Sobre o alcance do M5 ter crescido: não cresceu, e vale corrigir a hipótese.** `isFallbackReuse` só pode ser `true` quando `fetchResult` veio do ramo de fallback de `fetchDomainsFromApi:436`, que exige `cached.success && cached.ids.size > 0` — ou seja, `isFallbackReuse ⟹ success === true`. Logo, no guard `if (!fetchResult.success && !isFallbackReuse)`, a cláusula `&& !isFallbackReuse` nunca altera o resultado: o termo decisivo é `!fetchResult.success`, que lê um **campo real**, não uma identidade.
+
+Consequência prática: se alguém clonar o objeto em `fetchDomainsFromApi` (o cenário exato do M5), o resultado do fallback continua carregando `success: true`, então continua sendo persistido e **o retry de 15 min não quebra**. O que quebra é só o que o M5 já dizia — o contador e o warn param em silêncio. M5 segue MÉDIO, com o mesmo alcance e a mesma recomendação (sinal explícito `{ result, fromFallback }`, ou comentário em `:437`).
+
+A cláusula redundante é defensável como blindagem futura: se um dia o ramo de fallback for relaxado para reaproveitar entrada falha, o guard já estaria correto. Só registro que ela *lê* como se a identidade sustentasse o retry, quando não sustenta — o comentário de `:485-492` explica bem a intenção, então não vira finding.
+
+## Q3 — o edge case da Athena: aceitável, com uma ressalva de diagnóstico
+
+Confirmado por simulação (entrada antiga `success:true` com 0 IDs, WP falhando sempre):
+
+```
+t=0..90  FETCH falhou → NÃO persistido (retry no próx. ciclo) | success:true/0 IDs → invalidCount (!)
+```
+
+O `continue` pula o `.set` mas **não remove** a entrada antiga, e o builder do retorno (`:512-515`) a lê do cache e a devolve. Como ela tem `ids.size === 0`, `validateRanking` cai no ramo de `invalidCount` em vez de `removedByFailure`.
+
+Do ponto de vista de serving é equivalente — os links do domínio são removidos nos dois casos, então aceitável como está. A ressalva é de diagnóstico: durante um incidente o log diz `N links removidos por post inexistente` quando a causa real é API falhando, apontando o operador para o lado errado. A entrada também nunca envelhece para fora do mapa (soma-se ao BX5).
+
+**Recomendação (LOW):** no caminho do `continue`, remover a entrada existente quando ela não puder servir de fallback (`!success || ids.size === 0`). Ela não tem utilidade — o ramo de fallback já a rejeita — e removê-la faz o domínio reportar corretamente como `removedByFailure` e para de ocupar o mapa. Não há perda: um domínio legitimamente vazio volta a ser buscado no ciclo seguinte, que é o correto quando não se tem dado utilizável.
+
+## LOW
+
+- **L1 — atribuição de log no edge case acima** (`:484-494` + `validateRanking`): descrito em Q3.
+- **L2 — domínio permanentemente quebrado não tem backoff nem escalada** (`:441`, `:484-494`): sem cache utilizável, ele passa a ser re-tentado a cada 15 min indefinidamente, com um `console.warn` plano por tentativa (4/hora em vez de 1/hora). A divisão retry-rápido-sem-cache / backoff-lento-com-cache é a escolha certa — o caso sem cache tem os links removidos e merece pressa, o caso com cache está servindo e não é urgente. O que fica assimétrico é o alarme: o M4 deu contador escalonado ao caso **menos** grave (servindo IDs velhos) e o caso **mais** grave (links removidos) segue com aviso plano. Se voltarem a mexer nisso, um contador análogo aqui vale mais que o do M4.
+
+## Verificação
+
+- `npx tsc --noEmit` → exit 0.
+- `git status --porcelain` → apenas `src/controllers/redirect-controller.ts` e o scratchpad da Athena. Nada fora de escopo.
+- Grep confirmando consumidor único de `fetchAllValidPosts` e que `validPostsCache` só é tocado dentro dos próprios métodos de cache.
+- Rounds 3-5 commitados em `8d7c3d3`; o review completo (`scratchpad/agent-hera-ecpm.md`) entrou no commit.
+
+## Débito em aberto (inalterado desde o round 5)
+
+M5 (invariante de referência — agora o único lugar onde a identidade é load-bearing), M6 (`!Array.isArray(items)` → `'clean'`), os nits do round 5 (texto "até ~Xh" no warn, try/catch inalcançável, `while (true)` sem teto), L1/L2 acima, BX5 (cache sem poda), BX6 (sem single-flight) e I1/M3 (ruído de eCPM de baixa amostra — decisão de produto aprovada, monitorar impressões do link nº 1 por domínio).
+

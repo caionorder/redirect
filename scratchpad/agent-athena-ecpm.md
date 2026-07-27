@@ -248,3 +248,45 @@ git diff --stat -- src/controllers/redirect-controller.ts (cumulativo desde HEAD
 - Nenhum risco novo introduzido — I2 é estritamente mais conservador (domínios que antes eram marcados como sucesso com dados parciais agora corretamente caem no fallback/falha). Efeito esperado: menos "sumiço" de posts antigos válidos quando um domínio sofre rate-limit no meio da paginação.
 - M4 é só observabilidade (console.warn) — não muda comportamento de roteamento/serving.
 - Débito técnico documentado pela Hera que segue em aberto: BX5 (poda de cache órfão), BX6 (single-flight para `/api/process` concorrente com o cron).
+
+## Round 6 — I3 (falha em cache frio não fica pinada por 60 min)
+
+Hera aprovou o Round 5 com "APROVADO COM RESSALVAS — pode commitar" (`scratchpad/agent-hera-ecpm.md`, seção "Round 5"). MAIN commitou rounds 3-5 em `8d7c3d3` antes desta rodada. Caio aprovou aplicar SÓ o I3 (NÃO M5, M6, nits).
+
+### Problema (I3)
+`fetchAllValidPosts` gravava no cache TUDO que `fetchDomainsFromApi` devolvia, inclusive `{ success: false }` do ramo "API falhou e sem cache anterior", com `fetchedAt: now`. Isso fazia a falha virar uma entrada "fresca" — o domínio não era re-tentado por 60 min (`VALID_POSTS_CACHE_TTL_MS`), 4 ciclos de cron inteiros com os links do domínio em `/random`, mesmo que o WordPress se recuperasse 1 min depois. Cenário mais provável: boot/deploy, quando `initializeScheduledProcess` dispara `executeAllGroups` e varre os 19 catálogos de uma vez (o próprio burst que pode causar rate-limit/truncamento).
+
+### Fix aplicado
+No loop de gravação de `fetchAllValidPosts`: adicionei `isFallbackReuse = previousEntry !== undefined && previousEntry.result === fetchResult` (mesma detecção do M4, por identidade de referência) e um guard `if (!fetchResult.success && !isFallbackReuse) continue;` ANTES do `.set` — pula a persistência para falhas genuínas sem fallback disponível. Comentário explica o motivo (evitar pinning de 60 min, retry já no próximo ciclo de 15 min). O `.set` de sucesso e de fallback-reuse continuam exatamente como estavam (não tocados).
+
+Não precisei alterar a construção do Map final retornado (`result`, que só lê `this.validPostsCache`): como o domínio pulado não é persistido, ele fica ausente do Map retornado neste ciclo. Confirmei que isso é EQUIVALENTE ao comportamento anterior de "presente com `success:false`" — `validateRanking` (única consumidora, `:570-575`) trata `!result` (ausente) e `!result.success` (presente mas falho) de forma idêntica: ambos incrementam `removedByFailure` e removem o link. Ou seja, o efeito NESTE ciclo (link removido) não muda; o que muda é só o ciclo seguinte (domínio não fica preso no cache).
+
+### 4 cenários confirmados por leitura do código (pedidos pelo team-lead)
+- **(a) falha sem cache → não grava → próximo ciclo re-tenta:** `previousEntry` indefinido → `isFallbackReuse=false`; `fetchResult.success=false` (falha genuína) → guard dispara → `continue` (não persiste). Próximo ciclo: `this.validPostsCache.get(domain)` continua indefinido → domínio entra em `missingDomains` → re-tentado.
+- **(b) sucesso → grava com contador 0:** `fetchResult.success=true` → guard não dispara (`!fetchResult.success` é falso) → `isFallbackReuse` também é falso (objeto novo, referência não bate com nenhuma entrada anterior) → `consecutiveFallbacks` permanece 0 → `.set` com contador 0.
+- **(c) falha com fallback → grava com contador incrementado:** aqui é importante notar uma sutileza: quando `fetchDomainsFromApi` reaproveita o cache (tentativa fresca falhou mas havia entrada boa anterior), o objeto que ele coloca no Map retornado é a ENTRADA ANTIGA reaproveitada (`result.set(domain, cached)`), não um objeto `{success:false}` novo — então, de volta em `fetchAllValidPosts`, `fetchResult.success` é `true` (é o objeto bom reaproveitado) e `isFallbackReuse=true` (mesma referência de `previousEntry.result`). O guard (`!fetchResult.success && ...`) não dispara de qualquer forma (já que `fetchResult.success` é true), então o fluxo cai direto no bloco de incremento de `consecutiveFallbacks`, como esperado.
+- **(d) simulação da Hera — falha no boot (t=0), WP saudável em t=1min → links voltam em t=15, não t=60:** t=0: domínio sem entrada prévia, fetch falha (truncado/sem fallback) → guard dispara → não persiste → link removido NESTE ciclo (igual antes). t=15: `this.validPostsCache.get(domain)` continua indefinido (nunca foi setado em t=0) → cai em `missingDomains` → refetch → WP já está saudável → `success:true` → persistido com `fetchedAt=15`, `consecutiveFallbacks=0` → links voltam em t=15. **Confirmado: 15 min, não 60.**
+
+### Não aplicado (por instrução explícita do team-lead)
+M5 (tornar o sinal de fallback explícito em vez de depender de identidade de referência), M6 (`!Array.isArray(items)` fundindo corpo inesperado com catálogo vazio em `'clean'`), e os NITs (texto "até ~Xh" → "pelo menos ~Xh"; try/catch externo inalcançável; `MAX_PAGES` ausente). Mantive o texto "até ~Xh" exatamente como estava, mesmo sabendo (pelo review da Hera) que semanticamente é um piso, não um teto — não era escopo desta rodada.
+
+### Comandos rodados + resultados reais
+```
+git status --short / git log --oneline -3 (antes de editar)
+→ working tree limpo, HEAD em 8d7c3d3 "feat(ranking): corte por eCPM, cache WP por domínio e validação resiliente"
+
+npm run build
+→ passou sem erros.
+
+git status --short (final)
+→  M src/controllers/redirect-controller.ts   (único arquivo alterado)
+
+git diff --stat -- src/controllers/redirect-controller.ts (Round 6 isolada, contra HEAD 8d7c3d3)
+→ src/controllers/redirect-controller.ts | 17 ++++++++++++++++-
+→ 1 file changed, 16 insertions(+), 1 deletion(-)
+```
+
+### Riscos (Round 6)
+- Nenhum risco novo — é uma correção estritamente conservadora: nunca persiste um dado pior do que "nada" (falhas continuam removendo links imediatamente, só deixam de ficar pinadas).
+- Edge case notado (não é regressão, comportamento pré-existente preservado): se um domínio já tinha uma entrada "sucesso mas 0 IDs" (catálogo vazio, cache válido) e uma tentativa de refetch falha sem produzir fallback utilizável, essa entrada antiga permanece intacta no cache (não é sobrescrita pela falha) até seu próprio TTL expirar — comportamento conservador, correto, mas significa que nesse caso específico o domínio não seria re-tentado em 15 min, e sim quando a entrada antiga expirar. Não é o cenário pedido pelo team-lead (que é cache FRIO, sem entrada nenhuma) e não representa um problema novo.
+- Débito técnico que segue em aberto (fora de escopo, por instrução): M5, M6, nits do Round 5, BX5, BX6, I1/M3.
