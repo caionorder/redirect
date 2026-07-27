@@ -52,6 +52,28 @@ interface FetchPostIdsResult {
 }
 
 /**
+ * Estado da paginação de um endpoint WP REST (posts ou pages):
+ * - 'clean': terminou naturalmente (lista vazia, última página parcial, ou HTTP 400 em página > 1
+ *   — o WordPress usa esse código para "página além do total", ou seja, fim de catálogo, não erro).
+ * - 'failed': a primeira página nunca respondeu (endpoint ausente/indisponível).
+ * - 'truncated': a paginação começou mas foi interrompida por uma resposta não-OK (exceto o 400
+ *   acima) ou por erro de rede/timeout — o conjunto de IDs coletado até ali é parcial, não confiável.
+ */
+type EndpointFetchStatus = 'clean' | 'failed' | 'truncated';
+
+/**
+ * Entrada do cache de posts válidos por domínio, com timestamp individual —
+ * cada domínio expira de forma independente, não pelo relógio de outro domínio.
+ * `consecutiveFallbacks` conta quantas renovações seguidas reaproveitaram um resultado antigo
+ * (API falhando) em vez de um fetch bem-sucedido; zera a cada sucesso.
+ */
+interface ValidPostsCacheEntry {
+    result: FetchPostIdsResult;
+    fetchedAt: number;
+    consecutiveFallbacks: number;
+}
+
+/**
  * Interface para regras de redirecionamento fora do in-app browser
  * Se o usuario NAO esta no in-app (Facebook/Instagram) e a utm_campaign bate, redireciona
  */
@@ -94,10 +116,10 @@ export class RedirectController {
     private inAppRulesCache: InAppRule[] | null = null;
     private inAppRulesCacheTime: number = 0;
 
-    // Cache em memória para posts válidos por domínio { domain: FetchPostIdsResult }
-    private validPostsCache: Map<string, FetchPostIdsResult> = new Map();
-    private validPostsCacheTime: number = 0;
-    private readonly VALID_POSTS_CACHE_TTL_MS = 900000; // 15 minutos
+    // Cache em memória para posts válidos por domínio, com TTL por entrada (cada domínio expira
+    // no seu próprio horário — grupos diferentes não resetam o relógio uns dos outros)
+    private validPostsCache: Map<string, ValidPostsCacheEntry> = new Map();
+    private readonly VALID_POSTS_CACHE_TTL_MS = 3600000; // 60 minutos — cobre ~4 ciclos do cron de 15 min
 
     // Debug flag — habilita console.log per-request quando DEBUG_REDIRECT=1
     private static readonly DEBUG_REDIRECT = process.env.DEBUG_REDIRECT === '1';
@@ -243,10 +265,10 @@ export class RedirectController {
             });
         }
 
-        // Ordenar por revenue desc
-        globalRanking.sort((a, b) => b.revenue - a.revenue);
+        // Ordenar por eCPM desc (desempate por revenue, já que o eCPM chega arredondado a 2 casas)
+        globalRanking.sort((a, b) => (b.ecpm - a.ecpm) || (b.revenue - a.revenue));
 
-        // Limitar a 10 itens por domínio (top 10 por receita de cada domínio)
+        // Limitar a 10 itens por domínio (top 10 por eCPM de cada domínio, desempate por revenue)
         const domainCounts = new Map<string, number>();
         const limitedRanking = globalRanking.filter(item => {
             const count = domainCounts.get(item.domain) || 0;
@@ -257,8 +279,8 @@ export class RedirectController {
 
         console.log(`[CRON-${slug.toUpperCase()}] Ranking limitado: ${limitedRanking.length} itens (de ${globalRanking.length}, max 10 por domínio)`);
 
-        // Ordenar por eCPM decrescente (ranking global); desempate explícito por revenue
-        // porque o eCPM chega arredondado a 2 casas e empates são frequentes.
+        // O interleave exige ordem eCPM-desc; este sort garante isso independentemente
+        // do critério usado no corte acima.
         limitedRanking.sort((a, b) => (b.ecpm - a.ecpm) || (b.revenue - a.revenue));
 
         // Validar posts via API WordPress ANTES de intercalar (senão /random seria removido)
@@ -298,62 +320,85 @@ export class RedirectController {
 
     /**
      * Busca IDs paginados de um endpoint WP REST API (posts ou pages).
-     * Retorna true se conseguiu buscar pelo menos uma página com sucesso.
+     * Retorna o `EndpointFetchStatus` da paginação — ver definição do tipo para os três casos.
+     * Erro de rede/timeout é tratado como a página atual: 'failed' se ocorreu na primeira página,
+     * 'truncated' se já havia páginas lidas com sucesso.
      */
-    private async fetchIdsFromEndpoint(domain: string, endpoint: string, validIds: Set<string>): Promise<boolean> {
+    private async fetchIdsFromEndpoint(domain: string, endpoint: string, validIds: Set<string>): Promise<EndpointFetchStatus> {
         let page = 1;
         const perPage = 100;
-        let atLeastOneSuccess = false;
 
         while (true) {
-            const url = `https://${domain}/wp-json/wp/v2/${endpoint}?per_page=${perPage}&_fields=id&orderby=date&order=desc&page=${page}`;
-            const response = await fetch(url, {
-                signal: AbortSignal.timeout(10000),
-                headers: { 'User-Agent': 'RedirectBot/1.0' }
-            });
+            try {
+                const url = `https://${domain}/wp-json/wp/v2/${endpoint}?per_page=${perPage}&_fields=id&orderby=date&order=desc&page=${page}`;
+                const response = await fetch(url, {
+                    signal: AbortSignal.timeout(10000),
+                    headers: { 'User-Agent': 'RedirectBot/1.0' }
+                });
 
-            if (!response.ok) {
-                console.log(`[WP-VALIDATE] ${domain} ${endpoint} page=${page} HTTP ${response.status} - parando`);
-                break;
+                if (!response.ok) {
+                    if (page === 1) {
+                        console.log(`[WP-VALIDATE] ${domain} ${endpoint} page=1 HTTP ${response.status} - endpoint indisponível`);
+                        return 'failed';
+                    }
+                    if (response.status === 400) {
+                        console.log(`[WP-VALIDATE] ${domain} ${endpoint} page=${page} HTTP 400 - fim natural da paginação`);
+                        return 'clean';
+                    }
+                    console.warn(`[WP-VALIDATE] ${domain} ${endpoint} page=${page} HTTP ${response.status} - paginação interrompida (truncado)`);
+                    return 'truncated';
+                }
+
+                const items = await response.json() as Array<{ id: number }>;
+
+                if (!Array.isArray(items) || items.length === 0) return 'clean';
+
+                for (const item of items) {
+                    validIds.add(String(item.id));
+                }
+
+                if (items.length < perPage) return 'clean';
+                page++;
+            } catch (error) {
+                if (page === 1) {
+                    console.error(`[WP-VALIDATE] ${domain} ${endpoint}: erro na primeira página —`, error instanceof Error ? error.message : error);
+                    return 'failed';
+                }
+                console.warn(`[WP-VALIDATE] ${domain} ${endpoint} page=${page}: erro de rede/timeout — paginação interrompida (truncado)`, error instanceof Error ? error.message : error);
+                return 'truncated';
             }
-
-            atLeastOneSuccess = true;
-            const items = await response.json() as Array<{ id: number }>;
-
-            if (!Array.isArray(items) || items.length === 0) break;
-
-            for (const item of items) {
-                validIds.add(String(item.id));
-            }
-
-            if (items.length < perPage) break;
-            page++;
         }
-
-        return atLeastOneSuccess;
     }
 
     /**
      * Busca os IDs de posts e pages válidos de um domínio via API WordPress.
-     * Retorna { success: true, ids } se pelo menos um endpoint respondeu,
-     * ou { success: false, ids: empty } se ambos falharam.
+     * Sucesso exige pelo menos um endpoint com paginação completa ('clean') e nenhum endpoint
+     * truncado. Um endpoint ausente desde a primeira página ('failed') é tolerado — nem todo
+     * site expõe `/pages` —, mas um endpoint truncado no meio da paginação (rate limit, erro
+     * intermitente) produz um conjunto parcial que não deve virar autoritativo: nesse caso o
+     * domínio é marcado como falho, e o caller decide entre manter o cache anterior ou remover
+     * os links do domínio.
      */
     private async fetchValidPostIds(domain: string): Promise<FetchPostIdsResult> {
         const validIds = new Set<string>();
 
         try {
             // Buscar posts e pages em paralelo
-            const [postsOk, pagesOk] = await Promise.all([
-                this.fetchIdsFromEndpoint(domain, 'posts', validIds).catch(() => false),
-                this.fetchIdsFromEndpoint(domain, 'pages', validIds).catch(() => false),
+            const [postsStatus, pagesStatus] = await Promise.all([
+                this.fetchIdsFromEndpoint(domain, 'posts', validIds),
+                this.fetchIdsFromEndpoint(domain, 'pages', validIds),
             ]);
 
-            if (!postsOk && !pagesOk) {
-                console.error(`[WP-VALIDATE] ${domain}: ambos endpoints (posts + pages) falharam`);
+            const hasCleanEndpoint = postsStatus === 'clean' || pagesStatus === 'clean';
+            const hasTruncatedEndpoint = postsStatus === 'truncated' || pagesStatus === 'truncated';
+            const success = hasCleanEndpoint && !hasTruncatedEndpoint;
+
+            if (!success) {
+                console.error(`[WP-VALIDATE] ${domain}: validação falhou (posts: ${postsStatus}, pages: ${pagesStatus})`);
                 return { success: false, ids: validIds };
             }
 
-            console.log(`[WP-VALIDATE] ${domain}: ${validIds.size} IDs válidos encontrados (posts: ${postsOk ? 'ok' : 'falhou'}, pages: ${pagesOk ? 'ok' : 'falhou'})`);
+            console.log(`[WP-VALIDATE] ${domain}: ${validIds.size} IDs válidos encontrados (posts: ${postsStatus}, pages: ${pagesStatus})`);
             return { success: true, ids: validIds };
         } catch (error) {
             console.error(`[WP-VALIDATE] Erro ao buscar posts/pages de ${domain}:`, error instanceof Error ? error.message : error);
@@ -362,29 +407,18 @@ export class RedirectController {
     }
 
     /**
-     * Busca posts válidos de todos os domínios presentes no ranking.
-     * Retorna Map<domain, FetchPostIdsResult> para que o caller saiba se a API falhou ou não.
-     * Se a API falhou para um domínio, tenta usar o cache anterior como fallback.
+     * Busca via API WordPress os domínios informados, em paralelo.
+     * Se a API falhar para um domínio e houver uma entrada anterior bem-sucedida em `fallbackCache`
+     * (mesmo que já expirada), reaproveita essa entrada em vez de marcar o domínio como falho —
+     * um refetch com falha nunca rebaixa uma entrada boa.
      */
-    private async fetchAllValidPosts(domainsToCheck: string[]): Promise<Map<string, FetchPostIdsResult>> {
-        const now = Date.now();
-
-        // Usar cache se ainda válido
-        if (this.validPostsCache.size > 0 && (now - this.validPostsCacheTime) < this.VALID_POSTS_CACHE_TTL_MS) {
-            const allCached = domainsToCheck.every(d => this.validPostsCache.has(d));
-            if (allCached) {
-                console.log(`[WP-VALIDATE] Usando cache em memória (${this.validPostsCache.size} domínios)`);
-                return this.validPostsCache;
-            }
-        }
-
-        // Guardar referência ao cache anterior para fallback
-        const previousCache = this.validPostsCache;
-
+    private async fetchDomainsFromApi(
+        domains: string[],
+        fallbackCache: Map<string, ValidPostsCacheEntry>
+    ): Promise<Map<string, FetchPostIdsResult>> {
         const result = new Map<string, FetchPostIdsResult>();
 
-        // Buscar todos os domínios em paralelo
-        const promises = domainsToCheck.map(async (domain) => {
+        const promises = domains.map(async (domain) => {
             const fetchResult = await this.fetchValidPostIds(domain);
             return { domain, fetchResult };
         });
@@ -396,8 +430,8 @@ export class RedirectController {
                 const { domain, fetchResult } = r.value;
 
                 if (!fetchResult.success) {
-                    // API falhou — tentar usar cache anterior como fallback
-                    const cached = previousCache.get(domain);
+                    // API falhou — tentar usar cache anterior (mesmo expirado) como fallback
+                    const cached = fallbackCache.get(domain)?.result;
                     if (cached && cached.success && cached.ids.size > 0) {
                         console.log(`[WP-VALIDATE] ${domain}: API falhou, usando cache anterior (${cached.ids.size} IDs)`);
                         result.set(domain, cached);
@@ -412,10 +446,58 @@ export class RedirectController {
             }
         }
 
-        // Atualizar cache apenas com resultados bem-sucedidos
-        this.validPostsCache = result;
-        this.validPostsCacheTime = now;
+        return result;
+    }
 
+    /**
+     * Busca posts válidos dos domínios presentes no ranking, com cache em memória por domínio
+     * (TTL `VALID_POSTS_CACHE_TTL_MS`, timestamp individual por entrada — um domínio expira no seu
+     * próprio horário, independente de quando outros domínios ou outros grupos foram buscados).
+     * Domínios com entrada dentro do TTL reaproveitam o cache; os demais (ausentes ou expirados)
+     * são buscados via API. Os resultados são sempre mesclados no cache por domínio (nunca
+     * substituem o mapa inteiro), preservando entradas de domínios de outros grupos.
+     * Quando um domínio reaproveita o mesmo resultado de tentativas anteriores por falhas
+     * consecutivas da API (fallback), a contagem é registrada na entrada do cache; a partir da
+     * 2ª renovação seguida em fallback, emite `console.warn` com a idade estimada dos dados.
+     * Retorna sempre um Map novo (nunca a referência viva do cache), com uma entrada por domínio
+     * pedido cuja busca resolveu, para que o caller saiba se a API falhou ou não. Se a API falhou
+     * para um domínio, tenta usar o cache anterior (mesmo expirado) como fallback.
+     */
+    private async fetchAllValidPosts(domainsToCheck: string[]): Promise<Map<string, FetchPostIdsResult>> {
+        const now = Date.now();
+
+        const missingDomains = domainsToCheck.filter(domain => {
+            const entry = this.validPostsCache.get(domain);
+            return !entry || (now - entry.fetchedAt) >= this.VALID_POSTS_CACHE_TTL_MS;
+        });
+
+        if (missingDomains.length > 0) {
+            console.log(`[WP-VALIDATE] Buscando ${missingDomains.length} domínio(s) ausente(s)/expirado(s), reaproveitando ${domainsToCheck.length - missingDomains.length} do cache`);
+            const fetched = await this.fetchDomainsFromApi(missingDomains, this.validPostsCache);
+            for (const [domain, fetchResult] of fetched) {
+                const previousEntry = this.validPostsCache.get(domain);
+                let consecutiveFallbacks = 0;
+
+                // Reaproveitou o mesmo objeto do cache anterior (fallback-por-falha) — escalar contagem
+                if (previousEntry && previousEntry.result === fetchResult) {
+                    consecutiveFallbacks = previousEntry.consecutiveFallbacks + 1;
+                    if (consecutiveFallbacks >= 2) {
+                        const staleHours = (consecutiveFallbacks * this.VALID_POSTS_CACHE_TTL_MS) / 3600000;
+                        console.warn(`[WP-VALIDATE] ${domain}: ${consecutiveFallbacks} renovações seguidas em fallback — IDs podem estar defasados em até ~${staleHours}h`);
+                    }
+                }
+
+                this.validPostsCache.set(domain, { result: fetchResult, fetchedAt: now, consecutiveFallbacks });
+            }
+        } else {
+            console.log(`[WP-VALIDATE] Usando cache em memória (${domainsToCheck.length} domínios deste request)`);
+        }
+
+        const result = new Map<string, FetchPostIdsResult>();
+        for (const domain of domainsToCheck) {
+            const entry = this.validPostsCache.get(domain);
+            if (entry) result.set(domain, entry.result);
+        }
         return result;
     }
 
