@@ -11,7 +11,6 @@ import { IFilterRequest } from '../interfaces/filter-interfaces';
 import { redis } from '../config/redis';
 import { generateRandomPath } from '../config/domains';
 import { DomainGroupService } from '../services/domain-group-service';
-import { PageviewService } from '../services/pageview-service';
 
 /**
  * Interface para um link com eCPM
@@ -67,7 +66,6 @@ interface InAppRule {
 
 export class RedirectController {
     private superFilterService: SuperFilterService;
-    private pageviewService: PageviewService;
     private gamAdUnitRepository?: GamAdUnitRepository;
     private redirectLinkRepository?: RedirectLinkRepository;
     private redirectClickRepository?: RedirectClickRepository;
@@ -115,7 +113,6 @@ export class RedirectController {
 
     constructor(db?: Db) {
         this.superFilterService = new SuperFilterService();
-        this.pageviewService = new PageviewService();
         this.redisClient = redis;
         this.domainGroupService = DomainGroupService.getInstance(db);
 
@@ -180,8 +177,9 @@ export class RedirectController {
     }
 
     /**
-     * Busca em todos os domínios de um grupo os posts e cria ranking global por RPS (do maior para o menor).
+     * Busca em todos os domínios de um grupo os posts e cria ranking global por eCPM (do maior para o menor).
      * Salva no Redis uma lista: [{ url, domain, postId, ecpm, revenue, uniqueVisitors, rps }, ...]
+     * `uniqueVisitors` e `rps` são sempre 0 — mantidos apenas por compatibilidade de payload com consumidores existentes.
      */
     private async executeProcessForGroup(slug: string): Promise<RankedLinksList | null> {
         const groupDomains = await this.domainGroupService.getDomains(slug);
@@ -224,13 +222,14 @@ export class RedirectController {
             if (!item.domain || !item.custom_value) continue;
 
             const impressions = Number(item.impressions || 0);
-            if (impressions < 50) {
+            if (impressions < 100) {
                 skipped++;
                 continue;
             }
 
             const domain = item.domain as string;
-            const ecpm = parseFloat(String(item.ecpm || 0));
+            const parsedEcpm = parseFloat(String(item.ecpm || 0));
+            const ecpm = Number.isFinite(parsedEcpm) ? parsedEcpm : 0;
             const postId = String(item.custom_value);
 
             globalRanking.push({
@@ -258,34 +257,16 @@ export class RedirectController {
 
         console.log(`[CRON-${slug.toUpperCase()}] Ranking limitado: ${limitedRanking.length} itens (de ${globalRanking.length}, max 10 por domínio)`);
 
-        // Buscar unique visitors com throttle (3 simultâneas) para calcular RPS
-        const pageviewMap = await this.pageviewService.fetchBulkPageviews(
-            limitedRanking.map(item => ({ domain: item.domain, postId: item.postId })),
-            todayStr
-        );
-
-        for (const item of limitedRanking) {
-            const pv = pageviewMap.get(`${item.domain}_${item.postId}`);
-            if (pv) {
-                item.uniqueVisitors = pv.unique;
-                if (pv.unique > 0) {
-                    item.rps = item.revenue / pv.unique;
-                }
-            }
-        }
-
-        // Filtrar itens com menos de 10 unique visitors (RPS distorcido)
-        const filteredRanking = limitedRanking.filter(item => item.uniqueVisitors >= 10);
-
-        // Ordenar por RPS decrescente (ranking global)
-        filteredRanking.sort((a, b) => b.rps - a.rps);
+        // Ordenar por eCPM decrescente (ranking global); desempate explícito por revenue
+        // porque o eCPM chega arredondado a 2 casas e empates são frequentes.
+        limitedRanking.sort((a, b) => (b.ecpm - a.ecpm) || (b.revenue - a.revenue));
 
         // Validar posts via API WordPress ANTES de intercalar (senão /random seria removido)
-        const validatedRanking = await this.validateRanking(filteredRanking);
+        const validatedRanking = await this.validateRanking(limitedRanking);
 
         // Se não sobrou nenhum post real, manter o cache anterior
         if (validatedRanking.length === 0) {
-            console.log(`[CRON-${slug.toUpperCase()}] Nenhum post com RPS válido — mantendo cache anterior`);
+            console.log(`[CRON-${slug.toUpperCase()}] Nenhum post com eCPM válido — mantendo cache anterior`);
             return null;
         }
 
@@ -303,13 +284,13 @@ export class RedirectController {
                 'EX',
                 3600
             );
-            console.log(`[CRON-${slug.toUpperCase()}] Ranking global atualizado: ${topRanking.length} links no rank (${validatedRanking.length} validados, ${skipped} ignorados por <50 impressões)`);
+            console.log(`[CRON-${slug.toUpperCase()}] Ranking global atualizado: ${topRanking.length} links no rank (${validatedRanking.length} validados, ${skipped} ignorados por <100 impressões)`);
         }
 
         // Log do top 5
         const top = topRanking.slice(0, 5);
         for (let i = 0; i < top.length; i++) {
-            console.log(`[CRON-${slug.toUpperCase()}] #${i + 1} ${top[i].domain} p=${top[i].postId} (RPS: ${top[i].rps.toFixed(6)}, eCPM: ${top[i].ecpm.toFixed(4)}, uniques: ${top[i].uniqueVisitors})`);
+            console.log(`[CRON-${slug.toUpperCase()}] #${i + 1} ${top[i].domain} p=${top[i].postId} (eCPM: ${top[i].ecpm.toFixed(4)}, revenue: ${top[i].revenue.toFixed(4)})`);
         }
 
         return topRanking;
@@ -458,8 +439,8 @@ export class RedirectController {
         const domainsWithData = allDomains.filter(d => domainGroups.has(d) && domainGroups.get(d)!.length > 0);
         const domainsWithoutData = allDomains.filter(d => !domainGroups.has(d) || domainGroups.get(d)!.length === 0);
 
-        // Ordenar domínios com dados pelo melhor RPS do primeiro link
-        domainsWithData.sort((a, b) => domainGroups.get(b)![0].rps - domainGroups.get(a)![0].rps);
+        // Ordenar domínios com dados pelo melhor eCPM do primeiro link
+        domainsWithData.sort((a, b) => domainGroups.get(b)![0].ecpm - domainGroups.get(a)![0].ecpm);
 
         const domainOrder = [...domainsWithData, ...domainsWithoutData];
 
@@ -635,8 +616,13 @@ export class RedirectController {
     }
 
     /**
-     * Best RPS mode: finds the highest-RPS link whose domain the user hasn't visited this hour.
+     * Best RPS mode: the saved ranking is interleaved by domain (round-robin), not globally
+     * sorted — round 0 holds the best-eCPM link of each domain, round 1 the second-best, etc.
+     * Iterating it in order and returning the first unvisited domain therefore serves the
+     * highest-eCPM link of each domain the user hasn't seen this hour.
      * Falls back to random if all domains are exhausted.
+     * Naming (`bestrps_*`, `BEST_RPS`, this function name) is frozen: linkIds are the key used
+     * by redirects_clicks for click attribution — do not rename even though "RPS" no longer applies.
      */
     private async getBestRpsLink(
         clientIp: string,
@@ -657,7 +643,8 @@ export class RedirectController {
             }
         }
 
-        // Iterate ranking (already sorted by RPS descending) — find first unvisited domain
+        // Iterate the domain-interleaved ranking — round 0 is each domain's best eCPM link,
+        // so the first unvisited domain found here is that domain's top link.
         for (let i = 0; i < ranking.length; i++) {
             const link = ranking[i];
             if (!visitedDomains.has(link.domain)) {

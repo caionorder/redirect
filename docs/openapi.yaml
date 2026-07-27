@@ -5,7 +5,7 @@ info:
     Servico de redirecionamento HTTP latency-critical com tracking de clicks e regras condicionais.
 
     ## Visao geral
-    - **Hot path**: `GET /`, `GET /db`, `GET /:slug` retornam 302 navegacional para o melhor link disponivel (ranking eCPM/RPS).
+    - **Hot path**: `GET /`, `GET /db`, `GET /:slug` retornam 302 navegacional para o melhor link disponivel (ranking por eCPM).
     - **API administrativa**: `/api/*` para gerenciar grupos de dominio, links, rules e in-app rules.
     - **Health**: `/health`, `/health/detailed`, `/health/ready`, `/ping` (Kubernetes-friendly).
 
@@ -54,7 +54,7 @@ paths:
 
         1. Match em `Rules` (query params).
         2. Match em `InAppRules` por `utm_campaign` (redirect ou iframe HTML conforme user-agent).
-        3. Roteamento por ranking eCPM/RPS do grupo `main` (round-robin global ou best-RPS por IP, conforme `bestRpsMode`).
+        3. Roteamento por ranking eCPM do grupo `main` (round-robin global ou modo best-RPS por IP — serve o melhor eCPM de cada dominio ainda nao visitado nesta hora —, conforme `bestRpsMode`).
         4. Fallback: dominio aleatorio + path random.
 
         Sempre repassa todos os query params recebidos para o destino. Defaults UTM (`utm_source=redron`, `utm_medium=broadcast`) sao injetados quando ausentes. Se `?broad=` presente, usa como `utm_campaign` E incrementa `broad_clicks`. Click agregado e gravado no Mongo (fire-and-forget).
@@ -371,7 +371,7 @@ paths:
                 bestRpsMode:
                   type: boolean
                   description: |
-                    Se true, ativa modo best-RPS (busca o link de melhor RPS cujo dominio o IP ainda nao visitou nesta hora).
+                    Se true, ativa modo best-RPS (busca o link de melhor eCPM cujo dominio o IP ainda nao visitou nesta hora).
                     Se false, usa round-robin global por counter Redis.
             examples:
               rename:
@@ -526,14 +526,14 @@ paths:
   /api/process:
     get:
       tags: [admin]
-      summary: Disparar manualmente o calculo de ranking eCPM/RPS
+      summary: Disparar manualmente o calculo de ranking eCPM
       description: |
         Sem `slug`, executa para todos os grupos ativos e retorna todos os rankings.
         Com `?slug=main`, executa apenas o grupo solicitado.
 
-        Mesmo trabalho que o cron de 15 min: busca dados do GAM, calcula RPS via pageviews, valida posts via WP REST, intercala por dominio, salva no Redis (TTL 1h).
+        Mesmo trabalho que o cron de 15 min: busca dados do GAM, filtra itens com menos de 100 impressoes, ordena por eCPM decrescente (desempate por revenue), valida posts via WP REST, intercala por dominio, salva no Redis (TTL 1h).
 
-        **Caro**: faz fetch ao GAM ad units + pageviews API + WP REST. Use com parcimonia.
+        **Caro**: faz fetch ao GAM ad units + WP REST (posts/pages de todos os dominios do grupo). Use com parcimonia.
       parameters:
         - name: slug
           in: query
@@ -1123,18 +1123,22 @@ components:
 
     RankedLink:
       type: object
-      description: Item do ranking eCPM/RPS (cache Redis, recalculado a cada 15 min).
+      description: Item do ranking eCPM (cache Redis, recalculado a cada 15 min).
       properties:
         url: { type: string, format: uri }
         domain: { type: string }
         postId: { type: string, description: ID do post no WP, ou `random` quando dominio sem dados }
         ecpm: { type: number, format: float }
         revenue: { type: number, format: float }
-        uniqueVisitors: { type: integer }
+        uniqueVisitors:
+          type: integer
+          deprecated: true
+          description: Sempre 0. Campo mantido por compatibilidade de payload (nao usado desde a migracao do ranking para eCPM); nenhum consumidor le este valor.
         rps:
           type: number
           format: float
-          description: Revenue per session (revenue / uniqueVisitors)
+          deprecated: true
+          description: Sempre 0. Campo mantido por compatibilidade de payload (nao usado desde a migracao do ranking para eCPM); nenhum consumidor le este valor.
       required: [url, domain, postId, ecpm, revenue, uniqueVisitors, rps]
 
     RankResultItem:
