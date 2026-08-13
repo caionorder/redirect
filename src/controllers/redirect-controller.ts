@@ -11,6 +11,7 @@ import { IFilterRequest } from '../interfaces/filter-interfaces';
 import { redis } from '../config/redis';
 import { generateRandomPath } from '../config/domains';
 import { DomainGroupService } from '../services/domain-group-service';
+import { isExplorationRequest, decideServingSource } from '../utils/exploration-math';
 
 /**
  * Interface para um link com eCPM
@@ -108,6 +109,18 @@ export class RedirectController {
     private bestLinksMapCaches: Map<string, { data: RankedLinksList; time: number }> = new Map();
     private readonly CACHE_TTL_MS = 60000; // 1 minuto de cache em memória
 
+    // Cache em memória do pool de exploração por slug (mesmo padrão de bestLinksMapCaches)
+    private explorationPoolCaches: Map<string, { data: RankedLinksList; time: number }> = new Map();
+
+    // 1 a cada N requests (1/N do tráfego) vai para o pool de exploração em vez do ranking/bestRps
+    private readonly EXPLORATION_MOD = 10;
+
+    // Tamanho máximo do pool de exploração salvo por grupo a cada ciclo do cron
+    private readonly EXPLORATION_POOL_CAP = 300;
+
+    // Amostra máxima de candidatos de exploração por domínio a cada ciclo do cron
+    private readonly EXPLORATION_SAMPLE_PER_DOMAIN = 30;
+
     // Cache em memória para regras de redirecionamento
     private rulesCache: RedirectRule[] | null = null;
     private rulesCacheTime: number = 0;
@@ -159,6 +172,13 @@ export class RedirectController {
         if (slug === 'main') return 'redirect:best_links_map';
         if (slug === 'db') return 'redirect:best_links_map_db';
         return `redirect:best_links_map:${slug}`;
+    }
+
+    /**
+     * Retorna a chave Redis para o pool de exploração de um grupo.
+     */
+    private getRedisKeyForExplorationPool(slug: string): string {
+        return `redirect:exploration_pool:${slug}`;
     }
 
     /**
@@ -284,7 +304,7 @@ export class RedirectController {
         limitedRanking.sort((a, b) => (b.ecpm - a.ecpm) || (b.revenue - a.revenue));
 
         // Validar posts via API WordPress ANTES de intercalar (senão /random seria removido)
-        const validatedRanking = await this.validateRanking(limitedRanking);
+        const { ranking: validatedRanking, validPostsMap } = await this.validateRanking(limitedRanking);
 
         // Se não sobrou nenhum post real, manter o cache anterior
         if (validatedRanking.length === 0) {
@@ -315,7 +335,135 @@ export class RedirectController {
             console.log(`[CRON-${slug.toUpperCase()}] #${i + 1} ${top[i].domain} p=${top[i].postId} (eCPM: ${top[i].ecpm.toFixed(4)}, revenue: ${top[i].revenue.toFixed(4)})`);
         }
 
+        // Pool de exploração: posts válidos fora do top, para a fatia de exploração do serving.
+        // Guard de Redis ANTES de montar o pool — sem Redis o resultado seria descartado (M1).
+        if (this.redisClient) {
+            const domainsValidatedThisCycle = [...new Set(limitedRanking.map(link => link.domain))];
+            const explorationPool = await this.buildExplorationPool(
+                groupDomains,
+                domainsValidatedThisCycle,
+                validPostsMap,
+                topRanking
+            );
+            try {
+                await this.redisClient.set(
+                    this.getRedisKeyForExplorationPool(slug),
+                    JSON.stringify(explorationPool),
+                    'EX',
+                    3600
+                );
+                console.log(`[CRON-${slug.toUpperCase()}] Pool de exploração: ${explorationPool.length} itens`);
+            } catch (err) {
+                // Falha ao salvar o pool não pode derrubar o process — o ranking (feature
+                // existente) já foi salvo acima, antes deste bloco (ordem intencional).
+                console.error(`[CRON-${slug.toUpperCase()}] Erro ao salvar pool de exploração:`, err);
+            }
+        }
+
         return topRanking;
+    }
+
+    /**
+     * Monta o pool de exploração de um grupo: posts válidos por domínio que NÃO estão no
+     * `topRanking` deste ciclo. Amostra até `EXPLORATION_SAMPLE_PER_DOMAIN` candidatos aleatórios
+     * por domínio (a re-amostragem a cada 15 min dá rotação natural sobre o catálogo inteiro) e
+     * intercala por domínio, priorizando os domínios menos representados no topRanking, com cap
+     * de `EXPLORATION_POOL_CAP` itens.
+     *
+     * Universo de domínios é `groupDomains` (TODO o grupo), não só os que monetizaram hoje —
+     * senão um domínio novo/sem receita nunca ganharia exploração de post, só o `/random` do
+     * `interleaveByDomain`, o que deixaria o loop de retroalimentação fechado no eixo domínio.
+     *
+     * Custo de rede: domínios em `domainsValidatedThisCycle` (já tentados por `validateRanking`
+     * neste ciclo, saudáveis ou não) reaproveitam `validPostsMapFromRanking` — zero chamadas WP
+     * extra. Domínios de `groupDomains` fora dessa lista (sem dado GAM hoje) são buscados aqui
+     * pela primeira vez, via `fetchAllValidPosts` (cache de 60min por domínio segura o custo em
+     * ciclos seguintes). Domínios que falharam a validação NESTE ciclo não são re-tentados aqui —
+     * ficam fora do pool deste ciclo, com retry natural no próximo cron (mesma política de
+     * `fetchAllValidPosts`/b10cd19: um refetch com falha nunca é forçado no mesmo ciclo).
+     */
+    private async buildExplorationPool(
+        groupDomains: string[],
+        domainsValidatedThisCycle: string[],
+        validPostsMapFromRanking: Map<string, FetchPostIdsResult>,
+        topRanking: RankedLinksList
+    ): Promise<RankedLinksList> {
+        if (groupDomains.length === 0) return [];
+
+        const validatedSet = new Set(domainsValidatedThisCycle);
+        const extraDomains = groupDomains.filter(d => !validatedSet.has(d));
+
+        let validPostsMap = validPostsMapFromRanking;
+        if (extraDomains.length > 0) {
+            const extraResults = await this.fetchAllValidPosts(extraDomains);
+            validPostsMap = new Map(validPostsMapFromRanking);
+            for (const [domain, result] of extraResults) {
+                validPostsMap.set(domain, result);
+            }
+        }
+
+        const topSet = new Set<string>();
+        for (const item of topRanking) {
+            topSet.add(`${item.domain}:${item.postId}`);
+        }
+
+        // Candidatos por domínio: IDs válidos fora do top, amostrados (shuffle parcial) e
+        // limitados a EXPLORATION_SAMPLE_PER_DOMAIN
+        const candidatesByDomain = new Map<string, string[]>();
+        for (const domain of groupDomains) {
+            const result = validPostsMap.get(domain);
+            if (!result || !result.success || result.ids.size === 0) continue;
+
+            const candidates: string[] = [];
+            for (const postId of result.ids) {
+                if (!topSet.has(`${domain}:${postId}`)) candidates.push(postId);
+            }
+            if (candidates.length === 0) continue;
+
+            // Shuffle parcial (Fisher-Yates truncado): só os primeiros `sampleSize` swaps são
+            // necessários para uma amostra uniforme sem viés — não precisa embaralhar o catálogo
+            // WP inteiro (pode ter milhares de IDs, paginação sem teto) só para aproveitar poucos.
+            const sampleSize = Math.min(this.EXPLORATION_SAMPLE_PER_DOMAIN, candidates.length);
+            for (let i = 0; i < sampleSize; i++) {
+                const j = i + Math.floor(Math.random() * (candidates.length - i));
+                [candidates[i], candidates[j]] = [candidates[j], candidates[i]];
+            }
+            candidatesByDomain.set(domain, candidates.slice(0, sampleSize));
+        }
+
+        if (candidatesByDomain.size === 0) return [];
+
+        // Ordem dos domínios: menos representados no topRanking primeiro
+        const topCountByDomain = new Map<string, number>();
+        for (const item of topRanking) {
+            topCountByDomain.set(item.domain, (topCountByDomain.get(item.domain) || 0) + 1);
+        }
+        const domainOrder = [...candidatesByDomain.keys()].sort(
+            (a, b) => (topCountByDomain.get(a) || 0) - (topCountByDomain.get(b) || 0)
+        );
+
+        const maxCandidates = Math.max(...Array.from(candidatesByDomain.values()).map(c => c.length));
+        const pool: RankedLinksList = [];
+
+        for (let round = 0; round < maxCandidates && pool.length < this.EXPLORATION_POOL_CAP; round++) {
+            for (const domain of domainOrder) {
+                if (pool.length >= this.EXPLORATION_POOL_CAP) break;
+                const list = candidatesByDomain.get(domain)!;
+                if (round >= list.length) continue;
+                const postId = list[round];
+                pool.push({
+                    url: `https://${domain}/?p=${encodeURIComponent(postId)}`,
+                    domain: domain,
+                    postId: postId,
+                    ecpm: 0,
+                    revenue: 0,
+                    uniqueVisitors: 0,
+                    rps: 0
+                });
+            }
+        }
+
+        return pool;
     }
 
     /**
@@ -576,11 +724,15 @@ export class RedirectController {
      * - Se a API respondeu com sucesso: filtra posts inexistentes.
      * - Se a API falhou E não tem cache anterior: remove todos os links do domínio.
      * - Se a API retornou 0 posts com sucesso: remove todos os links do domínio (domínio vazio).
+     * Retorna também o `validPostsMap` resolvido, para o caller (hoje: `buildExplorationPool`)
+     * reaproveitar sem pagar `fetchAllValidPosts` de novo para os mesmos domínios.
      */
-    private async validateRanking(ranking: RankedLinksList): Promise<RankedLinksList> {
+    private async validateRanking(
+        ranking: RankedLinksList
+    ): Promise<{ ranking: RankedLinksList; validPostsMap: Map<string, FetchPostIdsResult> }> {
         const uniqueDomains = [...new Set(ranking.map(link => link.domain))];
 
-        if (uniqueDomains.length === 0) return ranking;
+        if (uniqueDomains.length === 0) return { ranking, validPostsMap: new Map() };
 
         const validPostsMap = await this.fetchAllValidPosts(uniqueDomains);
 
@@ -617,7 +769,7 @@ export class RedirectController {
             console.log(`[WP-VALIDATE] ${invalidCount} links removidos por post inexistente, ${removedByFailure} removidos por falha de API (${ranking.length} -> ${validated.length})`);
         }
 
-        return validated;
+        return { ranking: validated, validPostsMap };
     }
 
     /**
@@ -694,8 +846,11 @@ export class RedirectController {
 
     /**
      * Adiciona um domínio à lista de visitados e define TTL de 1h na primeira inserção.
+     * `type` é o mesmo parâmetro repassado a `getVisitorKey` (aceita qualquer slug de grupo,
+     * não só 'main'/'db' — usado também pelo branch de exploração em grupos com `bestRpsMode`
+     * para manter o rodízio por IP do `getBestRpsLink` coerente).
      */
-    private async addVisitedDomain(ip: string, type: 'main' | 'db', domain: string): Promise<void> {
+    private async addVisitedDomain(ip: string, type: string, domain: string): Promise<void> {
         if (!this.redisClient) return;
         const key = this.getVisitorKey(ip, type);
         try {
@@ -804,6 +959,36 @@ export class RedirectController {
         } catch (error) {
             console.error(`Error getting best links map for group ${slug}:`, error);
             return this.bestLinksMapCaches.get(slug)?.data || null;
+        }
+    }
+
+    /**
+     * Obtem o pool de exploração de um grupo pelo slug (com cache em memória + Redis).
+     * Espelha `getBestLinksMapForGroup`. Só deve ser chamado quando a request já foi
+     * decidida como exploração — evita pagar Redis extra nos 90% de requests normais.
+     */
+    private async getExplorationPoolForGroup(slug: string): Promise<RankedLinksList | null> {
+        try {
+            const now = Date.now();
+            const cached = this.explorationPoolCaches.get(slug);
+
+            if (cached && (now - cached.time) < this.CACHE_TTL_MS) {
+                return cached.data;
+            }
+
+            if (!this.redisClient) return cached?.data || null;
+
+            const redisKey = this.getRedisKeyForExplorationPool(slug);
+            const redisData = await this.redisClient.get(redisKey);
+            if (redisData) {
+                const parsed = JSON.parse(redisData) as RankedLinksList;
+                this.explorationPoolCaches.set(slug, { data: parsed, time: now });
+                return parsed;
+            }
+            return cached?.data || null;
+        } catch (error) {
+            console.error(`Error getting exploration pool for group ${slug}:`, error);
+            return this.explorationPoolCaches.get(slug)?.data || null;
         }
     }
 
@@ -1192,9 +1377,35 @@ export class RedirectController {
             let domain: string;
 
             if (globalRanking && globalRanking.length > 0) {
-                // Check if bestRpsMode is enabled for 'main'
+                // groupConfig buscado ANTES da decisão de exploração (o service já cacheia) —
+                // necessário para F3: em bestRpsMode, o domínio explorado precisa entrar no set
+                // de visitados do IP, senão o rodízio por IP do getBestRpsLink perde coerência.
                 const mainConfig = await this.domainGroupService.getGroupConfig('main');
-                if (mainConfig?.bestRpsMode) {
+
+                // Counter global por slug — chamado ANTES do branch de modo: a fatia de
+                // exploração é ortogonal ao bestRpsMode e precisa do mesmo counter nos dois.
+                // Tradeoff aceito conscientemente: grupos bestRpsMode passam a pagar 1 INCR
+                // Redis por request (antes, zero) — necessário pra fatia valer nesse modo também.
+                const visitIndex = await this.getGlobalVisitIndex('main');
+                const explorationPool = isExplorationRequest(visitIndex, this.EXPLORATION_MOD)
+                    ? await this.getExplorationPoolForGroup('main')
+                    : null;
+                const decision = decideServingSource(visitIndex, this.EXPLORATION_MOD, globalRanking.length, explorationPool?.length || 0);
+
+                if (decision.source === 'pool' && explorationPool) {
+                    const linkInfo = explorationPool[decision.index];
+                    redirectUrl = linkInfo.url;
+                    domain = linkInfo.domain;
+                    linkId = `explore_main_${domain}_${linkInfo.postId}`;
+                    logType = `EXPLORE #${decision.index + 1} MAIN`;
+
+                    // F3: manter o rodízio por IP do bestRps coerente — o domínio explorado
+                    // conta como visitado, senão o bestRps poderia reenviar o mesmo usuário
+                    // pra lá logo em seguida. Fire-and-forget (mesmo padrão do resto do arquivo).
+                    if (mainConfig?.bestRpsMode) {
+                        this.addVisitedDomain(clientIp, 'main', domain).catch(() => {});
+                    }
+                } else if (mainConfig?.bestRpsMode) {
                     const mainDomains = await this.domainGroupService.getDomains('main');
                     const bestRps = await this.getBestRpsLink(clientIp, 'main', globalRanking, mainDomains);
                     redirectUrl = bestRps.url;
@@ -1202,10 +1413,10 @@ export class RedirectController {
                     linkId = bestRps.linkId;
                     logType = bestRps.logType;
                 } else {
-                    // Counter global por slug — cada request vai pro próximo do ranking
-                    const visitIndex = await this.getGlobalVisitIndex('main');
-                    // Esgotou o ranking -> volta pro primeiro (ciclo)
-                    const idx = visitIndex % globalRanking.length;
+                    // Pool ausente/vazio (ou fora da fatia de exploração) -> índice do ranking,
+                    // já corrigido para não deixar slots sem tráfego (ver rankIndex() em
+                    // utils/exploration-math.ts).
+                    const idx = decision.index;
                     const linkInfo = globalRanking[idx];
                     redirectUrl = linkInfo.url;
                     domain = linkInfo.domain;
@@ -1357,19 +1568,45 @@ export class RedirectController {
             let domain: string;
 
             if (globalRanking && globalRanking.length > 0) {
-                // Check if bestRpsMode is enabled for this slug
+                // groupConfig buscado ANTES da decisão de exploração (o service já cacheia) —
+                // necessário para F3: em bestRpsMode, o domínio explorado precisa entrar no set
+                // de visitados do IP, senão o rodízio por IP do getBestRpsLink perde coerência.
                 const groupConfig = await this.domainGroupService.getGroupConfig(slug);
-                if (groupConfig?.bestRpsMode) {
+
+                // Counter global por slug — chamado ANTES do branch de modo: a fatia de
+                // exploração é ortogonal ao bestRpsMode e precisa do mesmo counter nos dois.
+                // Tradeoff aceito conscientemente: grupos bestRpsMode passam a pagar 1 INCR
+                // Redis por request (antes, zero) — necessário pra fatia valer nesse modo também.
+                const visitIndex = await this.getGlobalVisitIndex(slug);
+                const explorationPool = isExplorationRequest(visitIndex, this.EXPLORATION_MOD)
+                    ? await this.getExplorationPoolForGroup(slug)
+                    : null;
+                const decision = decideServingSource(visitIndex, this.EXPLORATION_MOD, globalRanking.length, explorationPool?.length || 0);
+
+                if (decision.source === 'pool' && explorationPool) {
+                    const linkInfo = explorationPool[decision.index];
+                    redirectUrl = linkInfo.url;
+                    domain = linkInfo.domain;
+                    linkId = `explore_${slug}_${domain}_${linkInfo.postId}`;
+                    logType = `EXPLORE #${decision.index + 1} ${slug.toUpperCase()}`;
+
+                    // F3: manter o rodízio por IP do bestRps coerente — o domínio explorado
+                    // conta como visitado, senão o bestRps poderia reenviar o mesmo usuário
+                    // pra lá logo em seguida. Fire-and-forget (mesmo padrão do resto do arquivo).
+                    if (groupConfig?.bestRpsMode) {
+                        this.addVisitedDomain(clientIp, slug, domain).catch(() => {});
+                    }
+                } else if (groupConfig?.bestRpsMode) {
                     const bestRps = await this.getBestRpsLink(clientIp, slug, globalRanking, groupDomains);
                     redirectUrl = bestRps.url;
                     domain = bestRps.domain;
                     linkId = bestRps.linkId;
                     logType = bestRps.logType;
                 } else {
-                    // Counter global por slug — cada request vai pro próximo do ranking
-                    const visitIndex = await this.getGlobalVisitIndex(slug);
-                    // Esgotou o ranking -> volta pro primeiro (ciclo)
-                    const idx = visitIndex % globalRanking.length;
+                    // Pool ausente/vazio (ou fora da fatia de exploração) -> índice do ranking,
+                    // já corrigido para não deixar slots sem tráfego (ver rankIndex() em
+                    // utils/exploration-math.ts).
+                    const idx = decision.index;
                     const linkInfo = globalRanking[idx];
                     redirectUrl = linkInfo.url;
                     domain = linkInfo.domain;

@@ -26,7 +26,7 @@
     "dev": "NODE_ENV=development tsx watch index.ts",
     "dev:win": "set NODE_ENV=development && tsx watch index.ts",
     "build": "tsc",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "tsx --test $(find src -name '*.test.ts')"
   },
   "devDependencies": {
     "@types/compression": "^1.7.5",
