@@ -113,7 +113,7 @@ export class RedirectController {
     private explorationPoolCaches: Map<string, { data: RankedLinksList; time: number }> = new Map();
 
     // 1 a cada N requests (1/N do tráfego) vai para o pool de exploração em vez do ranking/bestRps
-    private readonly EXPLORATION_MOD = 10;
+    private readonly EXPLORATION_MOD = 20;
 
     // Tamanho máximo do pool de exploração salvo por grupo a cada ciclo do cron
     private readonly EXPLORATION_POOL_CAP = 300;
