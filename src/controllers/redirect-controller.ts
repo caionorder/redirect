@@ -12,6 +12,7 @@ import { redis } from '../config/redis';
 import { generateRandomPath } from '../config/domains';
 import { DomainGroupService } from '../services/domain-group-service';
 import { isExplorationRequest, decideServingSource } from '../utils/exploration-math';
+import { normalizeGamDomain } from '../utils/domain-normalize';
 
 /**
  * Interface para um link com eCPM
@@ -237,10 +238,14 @@ export class RedirectController {
             year: 'numeric', month: '2-digit', day: '2-digit'
         }).format(new Date());
 
+        // Desde 05-08/08/2026 o GAM passou a retornar o domain do ETL com underscore(s) final(is)
+        // após um rename de ad units (ex.: `dopeaaps.com_`) — a query precisa casar as duas
+        // formas, senão os domínios afetados somem do resultado inteiro. Normalização do valor
+        // de volta acontece no loop abaixo, antes de qualquer uso (ver normalizeGamDomain).
         const filterRequest: IFilterRequest = {
             start: todayStr,
             end: todayStr,
-            domain: groupDomains,
+            domain: [...groupDomains, ...groupDomains.map(d => `${d}_`)],
             custom_key: "id_post_wp",
             group: ["domain", "custom_key", "custom_value"]
         };
@@ -256,8 +261,13 @@ export class RedirectController {
             return null;
         }
 
-        // Criar lista global de todos os links
-        const globalRanking: RankedLinksList = [];
+        // Criar lista global de todos os links. Dedup por `domain:postId` (chave pós-normalização)
+        // — em dias de transição do rename do GAM (ver comentário no filterRequest acima), a
+        // mesma combinação domínio+post pode vir em DUAS linhas (`dopeaaps.com` e
+        // `dopeaaps.com_`), já que a query casa as duas formas mas o agrupamento do superfilter é
+        // por domain+custom_value (pré-normalização). Mantém só o item de MAIOR revenue e
+        // descarta o outro — nunca soma (mudaria o eCPM, que já vem calculado do GAM).
+        const dedupedByKey = new Map<string, LinkInfo>();
 
         let skipped = 0;
         for (const item of data) {
@@ -269,21 +279,28 @@ export class RedirectController {
                 continue;
             }
 
-            const domain = item.domain as string;
+            const domain = normalizeGamDomain(String(item.domain));
             const parsedEcpm = parseFloat(String(item.ecpm || 0));
             const ecpm = Number.isFinite(parsedEcpm) ? parsedEcpm : 0;
             const postId = String(item.custom_value);
+            const revenue = Number(item.revenue || 0);
 
-            globalRanking.push({
+            const key = `${domain}:${postId}`;
+            const existing = dedupedByKey.get(key);
+            if (existing && existing.revenue >= revenue) continue;
+
+            dedupedByKey.set(key, {
                 url: `https://${domain}/?p=${encodeURIComponent(postId)}`,
                 domain: domain,
                 postId: postId,
                 ecpm: ecpm,
-                revenue: Number(item.revenue || 0),
+                revenue: revenue,
                 uniqueVisitors: 0,
                 rps: 0
             });
         }
+
+        const globalRanking: RankedLinksList = Array.from(dedupedByKey.values());
 
         // Ordenar por eCPM desc (desempate por revenue, já que o eCPM chega arredondado a 2 casas)
         globalRanking.sort((a, b) => (b.ecpm - a.ecpm) || (b.revenue - a.revenue));

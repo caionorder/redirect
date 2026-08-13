@@ -273,3 +273,106 @@ TODOS OS ASSERTS PASSARAM (importando as funções reais do controller).
 - Nenhum bloqueio. Diff final revisado — nenhuma mudança fora dos fixes listados acima
   (F1-F4, M1-M3, N1-N3) e das decisões explicitamente aceitas sem código. Pronto para
   nova rodada de review se o orquestrador julgar necessário, ou para commit/PR.
+
+---
+
+# Round 3 — hotfix urgente: domínio GAM com underscore (`fix/gam-domain-underscore`)
+
+Task separada, nova branch a partir da `main` atualizada (que já tinha o merge de
+`feat/exploration-10pct` e o ajuste posterior `chore/exploration-5pct`, reduzindo
+`EXPLORATION_MOD` de 10 para 20 — confirmado em `git log`, não fui eu quem fez essa
+redução, veio de outro ciclo). `git pull origin main` → já atualizado. Branch criada:
+`fix/gam-domain-underscore`.
+
+## Contexto / root cause (fornecido pelo orquestrador, não re-investigado)
+
+Entre 05-08/08/2026 os ad units do GAM foram renomeados e o campo `domain` retornado
+pelo ETL passou a vir com underscore(s) final(is) (`dopeaaps.com_`). O grupo `main` tem
+os domínios limpos (sem `_`), o filtro da query GAM é match exato, então 16/17 domínios
+sumiram do ranking desde ~08/08 — causa raiz da queda de receita reportada.
+
+## Fix aplicado
+
+Tudo em `executeProcessForGroup` (`src/controllers/redirect-controller.ts`):
+
+1. **Query expandida**: `filterRequest.domain` agora é
+   `[...groupDomains, ...groupDomains.map(d => \`${d}_\`)]` — casa as duas formas
+   (limpo e com underscore final) sem tocar no builder/superfilter.
+2. **Normalização centralizada**: nova função `normalizeGamDomain` em
+   `src/utils/domain-normalize.ts` (`domain.replace(/_+$/, '')` — remove só underscore(s)
+   no FINAL, preserva underscore no meio do domínio, ex.: `meu_site.com`). Aplicada no
+   loop que constrói `globalRanking`, ANTES de qualquer uso do domínio (URL, chave de
+   agrupamento, tudo a jusante — interleave, validação WP, pool de exploração — já usa o
+   valor normalizado, sem precisar de mudança em nenhum outro método).
+3. **Dedup do caso de transição**: como a query agora casa as duas formas mas o
+   agrupamento do superfilter (`group: ["domain", "custom_key", "custom_value"]`) é
+   pré-normalização, um dia com dado misto (`dopeaaps.com` e `dopeaaps.com_` para o
+   mesmo post) gera duas linhas que colapsam na mesma chave `domain:postId` após
+   normalizar. Implementado como `Map<string, LinkInfo>` (`dedupedByKey`) no lugar do
+   antigo `push` direto num array: para cada chave, mantém só o item de MAIOR `revenue`
+   e descarta o outro — não soma (mudaria o eCPM, que já vem calculado do GAM). Comentário
+   no código documenta que isso é esperado só em dias de transição.
+
+Não toquei no builder/superfilter (fora do escopo pedido) nem em `impressions` (o piso
+de 100 impressões continua aplicado por linha, antes da normalização/dedup — casos de
+transição com impressões divididas entre as duas variantes do domínio não foram
+tratados, não fazia parte do pedido; documentado aqui como observação, não como fix).
+
+## Arquivos tocados
+
+- `src/controllers/redirect-controller.ts` — import de `normalizeGamDomain`,
+  `filterRequest.domain` expandido, loop de construção do `globalRanking` reescrito
+  (normalização + dedup por maior revenue). Diff mínimo: +23/-6 linhas, só nesse trecho.
+- `src/utils/domain-normalize.ts` (novo) — `normalizeGamDomain`.
+- `src/utils/domain-normalize.test.ts` (novo) — testes `node:test` cobrindo: sem `_`; um
+  `_`; múltiplos `__`/`___`; string vazia; string só de `_`; underscore no MEIO do
+  domínio preservado (só o sufixo é removido).
+
+## Comandos rodados + resultados reais
+
+```
+$ npm run build
+> redirect@1.0.0 build
+> tsc
+(saída vazia — build limpo, sem erros)
+```
+
+```
+$ npm test
+> redirect@1.0.0 test
+> tsx --test $(find src -name '*.test.ts')
+...
+1..12
+# tests 12
+# suites 0
+# pass 12
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+```
+
+12 testes passando: os 6 novos de `domain-normalize.test.ts` (round 3) mais os 6
+existentes de `exploration-math.test.ts` (round 2, suite não quebrada por este fix —
+`package.json`'s `test` script já usa `find src -name '*.test.ts'`, que pega os dois
+arquivos automaticamente).
+
+## Riscos / observações
+
+- Fix aplicado a `executeProcessForGroup`, usado por TODOS os slugs/grupos (não só
+  `main`) — correto, já que o problema é no ETL/GAM, não específico de um grupo.
+- Dedup por maior revenue é uma escolha determinística para o caso raro de transição
+  (dado misto no mesmo dia); não houve como testar contra dado real do GAM (sem acesso a
+  produção), a lógica foi verificada só por leitura + build + os testes de
+  `normalizeGamDomain`. Recomendo confirmar no primeiro ciclo do cron em produção que o
+  ranking volta a incluir os 16/17 domínios que sumiram (`/api/rank` ou
+  `/api/distinct/domain` para conferir que o campo normalizado bate com os domínios do
+  grupo).
+- Não mexi no builder/superfilter nem em `GamAdUnitRepository` — se o ETL voltar a
+  produzir domain limpo no futuro, a query segue funcionando (a variante `_` some dos
+  resultados, sem erro).
+
+## Próximos passos (round 3)
+
+- Nenhum bloqueio. Diff mínimo e escopado exatamente ao pedido (query + normalização +
+  dedup). Não commitei/pushei — orquestrador cuida do git flow por ser hotfix urgente.
