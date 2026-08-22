@@ -1123,22 +1123,29 @@ components:
 
     RankedLink:
       type: object
-      description: Item do ranking eCPM (cache Redis, recalculado a cada 15 min).
+      description: Item do ranking eCPM, ou RPS com fallback eCPM em grupos bestRpsMode (cache Redis, recalculado a cada 15 min).
       properties:
         url: { type: string, format: uri }
         domain: { type: string }
-        postId: { type: string, description: ID do post no WP, ou `random` quando dominio sem dados }
+        postId:
+          type: string
+          description: "ID do post no WP, ou `random` quando dominio sem dados"
         ecpm: { type: number, format: float }
         revenue: { type: number, format: float }
         uniqueVisitors:
           type: integer
-          deprecated: true
-          description: Sempre 0. Campo mantido por compatibilidade de payload (nao usado desde a migracao do ranking para eCPM); nenhum consumidor le este valor.
+          description: >-
+            Visitantes unicos do post no dia (via API de pageviews), reais apenas em grupos com
+            `bestRpsMode: true` (ex.: main, desde 2026-08-22). Sempre 0 nos demais grupos (0
+            tambem quando a chamada a API de pageviews falhou neste ciclo, em grupos bestRpsMode).
         rps:
           type: number
           format: float
-          deprecated: true
-          description: Sempre 0. Campo mantido por compatibilidade de payload (nao usado desde a migracao do ranking para eCPM); nenhum consumidor le este valor.
+          description: >-
+            Revenue por unique visitor (revenue/uniqueVisitors), real apenas em grupos com
+            `bestRpsMode: true` e quando uniqueVisitors atingiu o piso minimo de confianca
+            (10) — abaixo disso o item cai no fallback eCPM e este campo fica 0. Sempre 0 nos
+            demais grupos.
       required: [url, domain, postId, ecpm, revenue, uniqueVisitors, rps]
 
     RankResultItem:
