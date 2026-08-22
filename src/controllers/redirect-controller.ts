@@ -13,24 +13,9 @@ import { generateRandomPath } from '../config/domains';
 import { DomainGroupService } from '../services/domain-group-service';
 import { isExplorationRequest, decideServingSource } from '../utils/exploration-math';
 import { normalizeGamDomain } from '../utils/domain-normalize';
-
-/**
- * Interface para um link com eCPM
- */
-interface LinkInfo {
-    url: string;
-    domain: string;
-    postId: string;
-    ecpm: number;
-    revenue: number;
-    uniqueVisitors: number;
-    rps: number;
-}
-
-/**
- * Ranking global: lista de links ordenados por eCPM (do maior para o menor)
- */
-type RankedLinksList = LinkInfo[];
+import { PageviewService } from '../services/pageview-service';
+import { computeRps, sortRpsWithEcpmFallback, RpsRankable } from '../utils/rps-ranking';
+import { interleaveByDomain, LinkInfo, RankedLinksList } from '../utils/interleave-by-domain';
 
 /**
  * Interface para regras de redirecionamento condicional
@@ -96,6 +81,7 @@ export class RedirectController {
     private broadClickRepository?: BroadClickRepository;
     private redisClient: typeof redis | null;
     private domainGroupService: DomainGroupService;
+    private pageviewService: PageviewService;
 
     // Chaves Redis
     private readonly VISITOR_PREFIX = 'visitor';
@@ -121,6 +107,15 @@ export class RedirectController {
 
     // Amostra máxima de candidatos de exploração por domínio a cada ciclo do cron
     private readonly EXPLORATION_SAMPLE_PER_DOMAIN = 30;
+
+    // Piso mínimo de uniques para um item ter RPS considerado confiável (grupos bestRpsMode);
+    // abaixo disso o item cai no fallback eCPM em vez de usar um RPS instável de amostra pequena.
+    private readonly MIN_UNIQUES_FOR_RPS = 10;
+
+    // Concorrência do fetchBulkUniques (grupos bestRpsMode). 8 em vez do default de 3 do
+    // PageviewService — derruba o pior caso do ciclo do cron (~160 chamadas) de ~2,7min para
+    // ~60s, mantendo margem sob o intervalo de 15 min do cron (ver noOverlap em cron.schedule).
+    private readonly RPS_UNIQUES_CONCURRENCY = 8;
 
     // Cache em memória para regras de redirecionamento
     private rulesCache: RedirectRule[] | null = null;
@@ -151,6 +146,7 @@ export class RedirectController {
         this.superFilterService = new SuperFilterService();
         this.redisClient = redis;
         this.domainGroupService = DomainGroupService.getInstance(db);
+        this.pageviewService = new PageviewService();
 
         if (db) {
             this.gamAdUnitRepository = new GamAdUnitRepository(db);
@@ -193,7 +189,10 @@ export class RedirectController {
             .then(() => console.log('[CRON] Cache inicial de todos os grupos populado com sucesso'))
             .catch(err => console.error('[CRON] Erro ao popular cache inicial:', err));
 
-        // Agendar para rodar a cada 15 minutos
+        // Agendar para rodar a cada 15 minutos. noOverlap evita que um ciclo atrasado (ex.: o
+        // modo RPS de grupos bestRpsMode pagando chamadas extras de pageview) dispare por cima
+        // do próximo agendamento — sem isso o default do node-cron é permitir sobreposição,
+        // dobrando a carga na API de pageviews e gerando escritas concorrentes na mesma chave Redis.
         const task = cron.schedule('*/15 * * * *', async () => {
             console.log('[CRON] Executando atualização agendada...');
             try {
@@ -201,7 +200,7 @@ export class RedirectController {
             } catch (error) {
                 console.error('[CRON] Erro:', error);
             }
-        });
+        }, { noOverlap: true });
         task.start();
     }
 
@@ -220,9 +219,12 @@ export class RedirectController {
     }
 
     /**
-     * Busca em todos os domínios de um grupo os posts e cria ranking global por eCPM (do maior para o menor).
+     * Busca em todos os domínios de um grupo os posts e cria ranking global por eCPM (ou por RPS
+     * em grupos `bestRpsMode`, com fallback eCPM — ver bloco de ranking por RPS abaixo).
      * Salva no Redis uma lista: [{ url, domain, postId, ecpm, revenue, uniqueVisitors, rps }, ...]
-     * `uniqueVisitors` e `rps` são sempre 0 — mantidos apenas por compatibilidade de payload com consumidores existentes.
+     * `uniqueVisitors` e `rps` são reais (via PageviewService) apenas para grupos com
+     * `bestRpsMode: true` (reativado em 2026-08-22); nos demais grupos permanecem sempre 0,
+     * mantidos apenas por compatibilidade de payload com consumidores existentes.
      */
     private async executeProcessForGroup(slug: string): Promise<RankedLinksList | null> {
         const groupDomains = await this.domainGroupService.getDomains(slug);
@@ -316,11 +318,19 @@ export class RedirectController {
 
         console.log(`[CRON-${slug.toUpperCase()}] Ranking limitado: ${limitedRanking.length} itens (de ${globalRanking.length}, max 10 por domínio)`);
 
-        // O interleave exige ordem eCPM-desc; este sort garante isso independentemente
-        // do critério usado no corte acima.
+        // O interleave exige uma ordem determinística; este sort garante eCPM-desc
+        // independentemente do critério usado no corte acima. Em modo RPS (abaixo, DEPOIS da
+        // validação WP), a reordenação por RPS acontece DEPOIS deste sort e é a ordem que
+        // efetivamente vale — este sort eCPM não pode desfazê-la.
         limitedRanking.sort((a, b) => (b.ecpm - a.ecpm) || (b.revenue - a.revenue));
 
-        // Validar posts via API WordPress ANTES de intercalar (senão /random seria removido)
+        // Config do grupo (cacheada pelo service) — lida cedo para reaproveitar no log do top 5
+        // mais abaixo, sem uma segunda chamada.
+        const groupConfig = await this.domainGroupService.getGroupConfig(slug);
+
+        // Validar posts via API WordPress ANTES de intercalar (senão /random seria removido) e
+        // ANTES do ranking por RPS abaixo — não faz sentido pagar chamada de pageview para um
+        // post que a validação WP vai descartar em seguida.
         const { ranking: validatedRanking, validPostsMap } = await this.validateRanking(limitedRanking);
 
         // Se não sobrou nenhum post real, manter o cache anterior
@@ -329,8 +339,44 @@ export class RedirectController {
             return null;
         }
 
+        // Ranking por RPS (revenue/uniques) — apenas para grupos com `bestRpsMode: true` (hoje:
+        // main). Reativado em 2026-08-22 com uniques reais via PageviewService.fetchBulkUniques
+        // (endpoint report-key-value-first — o único que filtra por post; ver docstring de
+        // fetchUniqueVisitors para o motivo de report-all não servir para métricas per-post).
+        // Fallback eCPM sempre que RPS não é confiável (uniques < MIN_UNIQUES_FOR_RPS ou falha da
+        // API) — nunca esvazia o ranking (lição da remoção de 27/07/2026). Opera sobre
+        // `validatedRanking` (não `limitedRanking`) para não gastar chamadas de pageview com posts
+        // que a validação WP acima vai descartar; `limitedRanking` permanece só eCPM-ordenado e é o
+        // que `domainsValidatedThisCycle` (mais abaixo) usa para o pool de exploração — nada entre
+        // este bloco e o interleave reordena `validatedRanking` de novo.
+        if (groupConfig?.bestRpsMode) {
+            const uniquesMap = await this.pageviewService.fetchBulkUniques(
+                validatedRanking.map(item => ({ domain: item.domain, postId: item.postId })),
+                todayStr,
+                this.RPS_UNIQUES_CONCURRENCY
+            );
+
+            let validRpsCount = 0;
+            const rankable: (RpsRankable & { ref: LinkInfo })[] = validatedRanking.map(item => {
+                const uniques = uniquesMap.get(`${item.domain}_${item.postId}`);
+                const rps = computeRps(item.revenue, uniques, this.MIN_UNIQUES_FOR_RPS);
+                if (rps !== null) validRpsCount++;
+                item.uniqueVisitors = uniques ?? 0;
+                return { rps, ecpm: item.ecpm, revenue: item.revenue, ref: item };
+            });
+
+            const sortedRankable = sortRpsWithEcpmFallback(rankable);
+            validatedRanking.length = 0;
+            for (const entry of sortedRankable) {
+                entry.ref.rps = entry.rps ?? 0;
+                validatedRanking.push(entry.ref);
+            }
+
+            console.log(`[CRON-${slug.toUpperCase()}] RPS mode: ${uniquesMap.size}/${validatedRanking.length} uniques obtidos, ${validRpsCount} itens com RPS válido (>=${this.MIN_UNIQUES_FOR_RPS} uniques), fallback eCPM para ${validatedRanking.length - validRpsCount}`);
+        }
+
         // Intercalar domínios (round-robin) — domínios sem dados entram como /random
-        const interleavedRanking = this.interleaveByDomain(validatedRanking, groupDomains);
+        const interleavedRanking = interleaveByDomain(validatedRanking, groupDomains);
 
         const topRanking = interleavedRanking.slice(0, 50);
 
@@ -346,10 +392,14 @@ export class RedirectController {
             console.log(`[CRON-${slug.toUpperCase()}] Ranking global atualizado: ${topRanking.length} links no rank (${validatedRanking.length} validados, ${skipped} ignorados por <100 impressões)`);
         }
 
-        // Log do top 5
+        // Log do top 5 — inclui RPS/uniques quando o grupo está em modo RPS
         const top = topRanking.slice(0, 5);
         for (let i = 0; i < top.length; i++) {
-            console.log(`[CRON-${slug.toUpperCase()}] #${i + 1} ${top[i].domain} p=${top[i].postId} (eCPM: ${top[i].ecpm.toFixed(4)}, revenue: ${top[i].revenue.toFixed(4)})`);
+            if (groupConfig?.bestRpsMode) {
+                console.log(`[CRON-${slug.toUpperCase()}] #${i + 1} ${top[i].domain} p=${top[i].postId} (RPS: ${top[i].rps.toFixed(4)}, uniques: ${top[i].uniqueVisitors}, eCPM: ${top[i].ecpm.toFixed(4)}, revenue: ${top[i].revenue.toFixed(4)})`);
+            } else {
+                console.log(`[CRON-${slug.toUpperCase()}] #${i + 1} ${top[i].domain} p=${top[i].postId} (eCPM: ${top[i].ecpm.toFixed(4)}, revenue: ${top[i].revenue.toFixed(4)})`);
+            }
         }
 
         // Pool de exploração: posts válidos fora do top, para a fatia de exploração do serving.
@@ -682,61 +732,6 @@ export class RedirectController {
     }
 
     /**
-     * Intercala links por domínio (round-robin) para evitar links consecutivos do mesmo domínio.
-     * Recebe o ranking já ordenado por eCPM decrescente.
-     * Em cada rodada, pega o próximo link de cada domínio (na ordem do melhor eCPM global do domínio).
-     */
-    private interleaveByDomain(ranking: RankedLinksList, allDomains: string[]): RankedLinksList {
-        // Agrupar links por domínio, mantendo a ordem de eCPM (já vem ordenado)
-        const domainGroups = new Map<string, LinkInfo[]>();
-
-        for (const link of ranking) {
-            if (!domainGroups.has(link.domain)) {
-                domainGroups.set(link.domain, []);
-            }
-            domainGroups.get(link.domain)!.push(link);
-        }
-
-        // Ordem dos domínios: primeiro os que têm dados (por melhor eCPM), depois os sem dados
-        const domainsWithData = allDomains.filter(d => domainGroups.has(d) && domainGroups.get(d)!.length > 0);
-        const domainsWithoutData = allDomains.filter(d => !domainGroups.has(d) || domainGroups.get(d)!.length === 0);
-
-        // Ordenar domínios com dados pelo melhor eCPM do primeiro link
-        domainsWithData.sort((a, b) => domainGroups.get(b)![0].ecpm - domainGroups.get(a)![0].ecpm);
-
-        const domainOrder = [...domainsWithData, ...domainsWithoutData];
-
-        // Descobrir o máximo de links que qualquer domínio tem
-        const maxLinks = Math.max(1, ...Array.from(domainGroups.values()).map(g => g.length));
-
-        // Round-robin: em cada rodada, passa por TODOS os domínios
-        // Se o domínio tem link na rodada -> usa o link
-        // Se não tem (sem dados ou já esgotou) -> /random daquele domínio
-        const result: RankedLinksList = [];
-
-        for (let round = 0; round < maxLinks; round++) {
-            for (const domain of domainOrder) {
-                const group = domainGroups.get(domain);
-                if (group && round < group.length) {
-                    result.push(group[round]);
-                } else {
-                    result.push({
-                        url: `https://${domain}${generateRandomPath()}`,
-                        domain: domain,
-                        postId: 'random',
-                        ecpm: 0,
-                        revenue: 0,
-                        uniqueVisitors: 0,
-                        rps: 0
-                    });
-                }
-            }
-        }
-
-        return result;
-    }
-
-    /**
      * Filtra o ranking removendo posts que não existem no WordPress.
      * - Se a API respondeu com sucesso: filtra posts inexistentes.
      * - Se a API falhou E não tem cache anterior: remove todos os links do domínio.
@@ -886,12 +881,14 @@ export class RedirectController {
 
     /**
      * Best RPS mode: the saved ranking is interleaved by domain (round-robin), not globally
-     * sorted — round 0 holds the best-eCPM link of each domain, round 1 the second-best, etc.
-     * Iterating it in order and returning the first unvisited domain therefore serves the
-     * highest-eCPM link of each domain the user hasn't seen this hour.
+     * sorted — round 0 holds each domain's best item according to the active criterion (eCPM,
+     * or RPS-with-eCPM-fallback in `bestRpsMode` groups — see `RedirectController.executeProcessForGroup`),
+     * round 1 the second-best, etc. Iterating it in order and returning the first unvisited
+     * domain therefore serves the best item of each domain the user hasn't seen this hour.
      * Falls back to random if all domains are exhausted.
      * Naming (`bestrps_*`, `BEST_RPS`, this function name) is frozen: linkIds are the key used
-     * by redirects_clicks for click attribution — do not rename even though "RPS" no longer applies.
+     * by redirects_clicks for click attribution — do not rename, regardless of which ranking
+     * criterion is active for the group.
      */
     private async getBestRpsLink(
         clientIp: string,
