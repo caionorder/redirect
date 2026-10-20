@@ -37,6 +37,7 @@ export class DomainGroupRepository {
             domains: data.domains || [],
             active: true,
             bestRpsMode: false,
+            ...(data.fixedPath ? { fixedPath: data.fixedPath } : {}),
             createdAt: now,
             updatedAt: now,
         };
@@ -45,15 +46,20 @@ export class DomainGroupRepository {
         return { ...document, _id: result.insertedId };
     }
 
-    async updateBySlug(slug: string, update: { slug?: string; name?: string; bestRpsMode?: boolean }): Promise<IDomainGroup | null> {
+    async updateBySlug(slug: string, update: { slug?: string; name?: string; bestRpsMode?: boolean; fixedPath?: string | null }): Promise<IDomainGroup | null> {
         const setFields: Record<string, unknown> = { updatedAt: new Date() };
         if (update.name) setFields.name = update.name;
         if (update.slug) setFields.slug = update.slug;
         if (typeof update.bestRpsMode === 'boolean') setFields.bestRpsMode = update.bestRpsMode;
+        if (typeof update.fixedPath === 'string') setFields.fixedPath = update.fixedPath;
+
+        const updateOps: { $set: Record<string, unknown>; $unset?: Record<string, ''> } = { $set: setFields };
+        // fixedPath === null remove o campo (volta ao comportamento padrão de ranking)
+        if (update.fixedPath === null) updateOps.$unset = { fixedPath: '' };
 
         const result = await this.collection.findOneAndUpdate(
             { slug },
-            { $set: setFields },
+            updateOps,
             { returnDocument: 'after' }
         );
         return result ?? null;

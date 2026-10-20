@@ -16,6 +16,7 @@ import { normalizeGamDomain } from '../utils/domain-normalize';
 import { PageviewService } from '../services/pageview-service';
 import { computeRps, sortRpsWithEcpmFallback, RpsRankable } from '../utils/rps-ranking';
 import { interleaveByDomain, LinkInfo, RankedLinksList } from '../utils/interleave-by-domain';
+import { buildFixedPathUrl, buildFixedPathLinkId, pickFixedPathDomain, resolveEffectiveFixedPath } from '../utils/fixed-path';
 
 /**
  * Interface para regras de redirecionamento condicional
@@ -211,6 +212,12 @@ export class RedirectController {
         const slugs = await this.domainGroupService.getActiveSlugs();
         for (const slug of slugs) {
             try {
+                // Grupos fixedPath nao usam ranking de posts — evita queries GAM/WP/pageviews inuteis
+                const cfg = await this.domainGroupService.getGroupConfig(slug);
+                if (this.getEffectiveFixedPath(slug, cfg?.fixedPath)) {
+                    if (RedirectController.DEBUG_REDIRECT) console.log(`[CRON-${slug.toUpperCase()}] fixedPath configurado — ranking ignorado`);
+                    continue;
+                }
                 await this.executeProcessForGroup(slug);
             } catch (error) {
                 console.error(`[CRON-${slug.toUpperCase()}] Erro:`, error);
@@ -947,6 +954,61 @@ export class RedirectController {
         };
     }
 
+    private readonly invalidFixedPathLogged = new Set<string>();
+
+    /**
+     * fixedPath efetivo de um grupo (revalida na leitura; 'main' nunca e fixedPath).
+     * Valor invalido vindo do Mongo: loga uma vez por slug (sem o valor) e segue o fluxo padrao.
+     */
+    private getEffectiveFixedPath(slug: string, stored: unknown): string | null {
+        const r = resolveEffectiveFixedPath(slug, stored);
+        if (r.invalid && !this.invalidFixedPathLogged.has(slug)) {
+            this.invalidFixedPathLogged.add(slug);
+            console.error(`[FIXED_PATH] fixedPath invalido ignorado no grupo '${slug}' — usando fluxo padrao`);
+        }
+        return r.path;
+    }
+
+    /**
+     * Grupos com `fixedPath`: o destino e sempre `https://<dominio><fixedPath>`; so o dominio
+     * rotaciona. Reaproveita o set Redis de visitados do bestRps (mesma chave por IP+slug+hora):
+     * aleatorio uniforme entre os nao visitados; esgotados -> aleatorio entre todos.
+     * Prefixos de linkId: `bestrps_*` quando bestRpsMode (mesma familia de atribuicao de cliques),
+     * `fixed_*` caso contrario. Sufixo `_fixed` nunca colide com postId numerico do ranking.
+     */
+    private async getFixedPathLink(
+        clientIp: string,
+        slug: string,
+        groupDomains: string[],
+        fixedPath: string,
+        bestRpsMode: boolean
+    ): Promise<{ url: string; domain: string; linkId: string; logType: string }> {
+        let visitedDomains: Set<string> = new Set();
+        if (this.redisClient) {
+            try {
+                const members = await this.redisClient.smembers(this.getVisitorKey(clientIp, slug));
+                visitedDomains = new Set(members);
+            } catch (error) {
+                console.error(`[FIXED_PATH] Error reading visited domains:`, error);
+            }
+        }
+
+        // groupDomains nao vazio e garantido pelo chamador (503 antes)
+        const pick = pickFixedPathDomain(groupDomains, visitedDomains)!;
+        if (!pick.exhausted) {
+            await this.addVisitedDomain(clientIp, slug, pick.domain);
+        }
+
+        const linkId = buildFixedPathLinkId(slug, pick.domain, pick.exhausted, bestRpsMode);
+
+        return {
+            url: buildFixedPathUrl(pick.domain, fixedPath),
+            domain: pick.domain,
+            linkId,
+            logType: `FIXED_PATH${pick.exhausted ? ' EXHAUSTED' : ''} ${slug.toUpperCase()}`
+        };
+    }
+
     /**
      * Obtem o ranking de melhores links de um grupo pelo slug (com cache em memória + Redis)
      */
@@ -1573,20 +1635,28 @@ export class RedirectController {
             const clientIp = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ||
                            req.socket.remoteAddress || 'unknown';
 
-            // Buscar ranking global de links do grupo
-            const globalRanking = await this.getBestLinksMapForGroup(slug);
+            // groupConfig buscado ANTES do ranking (o service já cacheia) — usado pelo short-circuit
+            // fixedPath e, na decisão de exploração, para F3: em bestRpsMode, o domínio explorado
+            // precisa entrar no set de visitados do IP, senão o rodízio por IP do getBestRpsLink
+            // perde coerência.
+            const groupConfig = await this.domainGroupService.getGroupConfig(slug);
+            const fixedPath = this.getEffectiveFixedPath(slug, groupConfig?.fixedPath);
+
+            // Grupos fixedPath não usam ranking de posts: pula a leitura do ranking
+            const globalRanking = fixedPath ? null : await this.getBestLinksMapForGroup(slug);
 
             let redirectUrl: string;
             let linkId: string;
             let logType: string;
             let domain: string;
 
-            if (globalRanking && globalRanking.length > 0) {
-                // groupConfig buscado ANTES da decisão de exploração (o service já cacheia) —
-                // necessário para F3: em bestRpsMode, o domínio explorado precisa entrar no set
-                // de visitados do IP, senão o rodízio por IP do getBestRpsLink perde coerência.
-                const groupConfig = await this.domainGroupService.getGroupConfig(slug);
-
+            if (fixedPath) {
+                const fixed = await this.getFixedPathLink(clientIp, slug, groupDomains, fixedPath, !!groupConfig?.bestRpsMode);
+                redirectUrl = fixed.url;
+                domain = fixed.domain;
+                linkId = fixed.linkId;
+                logType = fixed.logType;
+            } else if (globalRanking && globalRanking.length > 0) {
                 // Counter global por slug — chamado ANTES do branch de modo: a fatia de
                 // exploração é ortogonal ao bestRpsMode e precisa do mesmo counter nos dois.
                 // Tradeoff aceito conscientemente: grupos bestRpsMode passam a pagar 1 INCR
