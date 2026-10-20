@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
 import { DomainGroupService } from '../services/domain-group-service';
+import { validateFixedPath, FIXED_PATH_MAIN_ERROR } from '../utils/fixed-path';
 
 export class DomainGroupController {
     private service: DomainGroupService;
@@ -23,11 +24,11 @@ export class DomainGroupController {
 
     /**
      * POST /api/domain-groups — criar grupo
-     * Body: { slug: string, name: string, domains?: string[] }
+     * Body: { slug: string, name: string, domains?: string[], fixedPath?: string }
      */
     async create(req: Request, res: Response): Promise<void> {
         try {
-            const { slug, name, domains } = req.body;
+            const { slug, name, domains, fixedPath } = req.body;
 
             if (!slug || !name) {
                 res.status(400).json({ error: 'slug and name are required' });
@@ -40,7 +41,21 @@ export class DomainGroupController {
                 return;
             }
 
-            const group = await this.service.createGroup({ slug, name, domains });
+            let validFixedPath: string | undefined;
+            if (fixedPath !== undefined) {
+                if (slug === 'main') {
+                    res.status(400).json({ error: FIXED_PATH_MAIN_ERROR });
+                    return;
+                }
+                const fp = validateFixedPath(fixedPath);
+                if (!fp.ok) {
+                    res.status(400).json({ error: fp.error });
+                    return;
+                }
+                validFixedPath = fp.value;
+            }
+
+            const group = await this.service.createGroup({ slug, name, domains, fixedPath: validFixedPath });
             res.status(201).json({ group });
         } catch (error) {
             // Duplicate key error
@@ -54,16 +69,17 @@ export class DomainGroupController {
     }
 
     /**
-     * PUT /api/domain-groups/:slug — editar slug e/ou name
-     * Body: { slug?: string, name?: string }
+     * PUT /api/domain-groups/:slug — editar slug, name, bestRpsMode e/ou fixedPath
+     * Body: { slug?: string, name?: string, bestRpsMode?: boolean, fixedPath?: string | null }
+     * fixedPath: null remove o path fixo do grupo.
      */
     async update(req: Request, res: Response): Promise<void> {
         try {
             const currentSlug = req.params.slug as string;
-            const { slug: newSlug, name, bestRpsMode } = req.body;
+            const { slug: newSlug, name, bestRpsMode, fixedPath } = req.body;
 
-            if (!newSlug && !name && typeof bestRpsMode !== 'boolean') {
-                res.status(400).json({ error: 'At least one of slug, name, or bestRpsMode is required' });
+            if (!newSlug && !name && typeof bestRpsMode !== 'boolean' && fixedPath === undefined) {
+                res.status(400).json({ error: 'At least one of slug, name, bestRpsMode, or fixedPath is required' });
                 return;
             }
 
@@ -72,7 +88,24 @@ export class DomainGroupController {
                 return;
             }
 
-            const group = await this.service.updateGroup(currentSlug, { slug: newSlug, name, bestRpsMode });
+            // fixedPath: string válida (define) ou null (remove)
+            let validFixedPath: string | null | undefined;
+            if (fixedPath === null) {
+                validFixedPath = null;
+            } else if (fixedPath !== undefined) {
+                if (currentSlug === 'main' || newSlug === 'main') {
+                    res.status(400).json({ error: FIXED_PATH_MAIN_ERROR });
+                    return;
+                }
+                const fp = validateFixedPath(fixedPath);
+                if (!fp.ok) {
+                    res.status(400).json({ error: fp.error });
+                    return;
+                }
+                validFixedPath = fp.value;
+            }
+
+            const group = await this.service.updateGroup(currentSlug, { slug: newSlug, name, bestRpsMode, fixedPath: validFixedPath });
             if (!group) {
                 res.status(404).json({ error: 'Group not found' });
                 return;

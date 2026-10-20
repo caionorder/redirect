@@ -149,6 +149,8 @@ paths:
         Slugs ativos no startup recebem rota estatica. Slugs criados apos startup caem no catch-all que olha `getActiveSlugs()` e despacha para `redirectByGroup` ou cai no `redirect` principal (`main`).
 
         Se `slug` nao for um grupo ativo, executa o redirect principal (grupo `main`).
+        Grupos com `fixedPath` (ver schema `DomainGroup`) ignoram o ranking: redirecionam para `https://<dominio><fixedPath>`
+        rotacionando so o dominio por IP, e repassam query params/UTMs normalmente.
       parameters:
         - name: slug
           in: path
@@ -317,6 +319,21 @@ paths:
                   type: array
                   items: { type: string, format: hostname }
                   example: ['site1.com', 'site2.com']
+                fixedPath:
+                  type: string
+                  pattern: '^/[A-Za-z0-9._~-]+(/[A-Za-z0-9._~-]+)*/?$'
+                  minLength: 2
+                  maxLength: 200
+                  description: |
+                    Path fixo do grupo (ex.: `/first-hello/`). Quando definido, o grupo redireciona SEMPRE para
+                    `https://<dominio><fixedPath>` (mais query params/UTMs repassados), rotacionando apenas o dominio
+                    entre os `domains` do grupo: aleatorio entre os dominios ainda nao visitados pelo IP na hora; se todos
+                    ja foram visitados, aleatorio entre todos. O ranking de posts e a exploracao sao ignorados e o cron
+                    de ranking pula o grupo. linkId: `bestrps_<slug>_<dominio>_fixed` (bestRpsMode) ou `fixed_<slug>_<dominio>`.
+                    Regra: 2..200 chars, comeca com `/`, segmentos de `[A-Za-z0-9._~-]` separados por uma unica `/`,
+                    barra final opcional; sem `//`, `?`, `#`, `%`, `:`, `@`, `\`, espacos nem segmentos `.`/`..`.
+                    Nao suportado no grupo `main` (400 `fixedPath is not supported for the main group`).
+                  example: /first-hello/
             examples:
               minimal:
                 value:
@@ -352,7 +369,7 @@ paths:
   /api/domain-groups/{slug}:
     put:
       tags: [domain-groups]
-      summary: Atualizar grupo (slug, name, bestRpsMode)
+      summary: Atualizar grupo (slug, name, bestRpsMode, fixedPath)
       parameters:
         - $ref: '#/components/parameters/GroupSlug'
       requestBody:
@@ -361,7 +378,7 @@ paths:
           application/json:
             schema:
               type: object
-              description: Pelo menos um campo deve ser informado
+              description: Pelo menos um campo deve ser informado (slug, name, bestRpsMode ou fixedPath)
               properties:
                 slug:
                   type: string
@@ -373,11 +390,27 @@ paths:
                   description: |
                     Se true, ativa modo best-RPS (busca o link de melhor eCPM cujo dominio o IP ainda nao visitou nesta hora).
                     Se false, usa round-robin global por counter Redis.
+                fixedPath:
+                  type: string
+                  nullable: true
+                  pattern: '^/[A-Za-z0-9._~-]+(/[A-Za-z0-9._~-]+)*/?$'
+                  minLength: 2
+                  maxLength: 200
+                  description: |
+                    Define o path fixo do grupo (mesma regra e comportamento do POST). Envie `null` para remover
+                    o path fixo e voltar ao comportamento padrao de ranking.
+                    Definir uma string nao e suportado quando o grupo (slug atual ou novo) e `main`
+                    (400 `fixedPath is not supported for the main group`); `null` e sempre aceito.
+                  example: /first-hello/
             examples:
               rename:
                 value: { slug: novo-slug, name: Novo Nome }
               toggle-mode:
                 value: { bestRpsMode: true }
+              set-fixed-path:
+                value: { fixedPath: /first-hello/ }
+              remove-fixed-path:
+                value: { fixedPath: null }
       responses:
         '200':
           description: Grupo atualizado
@@ -1081,6 +1114,20 @@ components:
           type: boolean
           description: Se true, usa best-RPS por IP (mais lento, mais inteligente). Se false/ausente, round-robin.
           example: false
+        fixedPath:
+          type: string
+          pattern: '^/[A-Za-z0-9._~-]+(/[A-Za-z0-9._~-]+)*/?$'
+          minLength: 2
+          maxLength: 200
+          description: |
+            Path fixo do grupo (ex.: `/first-hello/`). Quando definido, o grupo redireciona SEMPRE para
+            `https://<dominio><fixedPath>` (mais query params/UTMs repassados), rotacionando apenas o dominio
+            entre os `domains` do grupo: aleatorio entre os dominios ainda nao visitados pelo IP na hora; se todos
+            ja foram visitados, aleatorio entre todos. O ranking de posts e a exploracao sao ignorados e o cron
+            de ranking pula o grupo. linkId: `bestrps_<slug>_<dominio>_fixed` (bestRpsMode) ou `fixed_<slug>_<dominio>`.
+            Regra: 2..200 chars, comeca com `/`, segmentos de `[A-Za-z0-9._~-]` separados por uma unica `/`,
+            barra final opcional; sem `//`, `?`, `#`, `%`, `:`, `@`, `\`, espacos nem segmentos `.`/`..`.
+          example: /first-hello/
         createdAt: { type: string, format: date-time }
         updatedAt: { type: string, format: date-time }
       required: [slug, name, domains, active]

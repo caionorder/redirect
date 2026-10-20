@@ -172,7 +172,7 @@ export class DomainGroupService {
     /**
      * Deleta um grupo pelo slug
      */
-    async updateGroup(slug: string, update: { slug?: string; name?: string; bestRpsMode?: boolean }): Promise<IDomainGroup | null> {
+    async updateGroup(slug: string, update: { slug?: string; name?: string; bestRpsMode?: boolean; fixedPath?: string | null }): Promise<IDomainGroup | null> {
         const group = await this.repository.updateBySlug(slug, update);
         if (group) {
             await this.refreshCache();
