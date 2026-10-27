@@ -1,5 +1,9 @@
 import { Db, Collection } from 'mongodb';
+import { RankedLinksList } from '../utils/interleave-by-domain';
 import { IDomainGroup, ICreateDomainGroup, domainGroupCollectionName } from '../schemas/domain-group-schema';
+
+/** Projeção das leituras "de config": o ranking persistido (e sua data) é interno e não deve inflar cache/API. */
+const WITHOUT_LAST_RANKING = { lastRanking: 0, lastRankingAt: 0 } as const;
 
 export class DomainGroupRepository {
     private collection: Collection<IDomainGroup>;
@@ -18,15 +22,36 @@ export class DomainGroupRepository {
     }
 
     async findAll(): Promise<IDomainGroup[]> {
-        return this.collection.find({}).sort({ createdAt: -1 }).toArray();
+        return this.collection.find({}, { projection: WITHOUT_LAST_RANKING }).sort({ createdAt: -1 }).toArray();
     }
 
     async findBySlug(slug: string): Promise<IDomainGroup | null> {
-        return this.collection.findOne({ slug });
+        return this.collection.findOne({ slug }, { projection: WITHOUT_LAST_RANKING });
+    }
+
+    /**
+     * Persiste o último ranking válido do grupo (sobrevive ao wipe do Redis no deploy).
+     * `$set` pontual por slug — não toca updatedAt (não é edição de config) nem cria documento.
+     */
+    async saveLastRanking(slug: string, ranking: RankedLinksList): Promise<void> {
+        await this.collection.updateOne(
+            { slug },
+            { $set: { lastRanking: ranking, lastRankingAt: new Date() } }
+        );
+    }
+
+    /** Lê só o ranking persistido (projeção) — usado no serving quando o Redis está vazio. */
+    async findLastRanking(slug: string): Promise<{ ranking: RankedLinksList; at: Date | null } | null> {
+        const doc = await this.collection.findOne(
+            { slug },
+            { projection: { _id: 0, lastRanking: 1, lastRankingAt: 1 } }
+        );
+        if (!doc || !Array.isArray(doc.lastRanking) || doc.lastRanking.length === 0) return null;
+        return { ranking: doc.lastRanking, at: doc.lastRankingAt ?? null };
     }
 
     async findActiveGroups(): Promise<IDomainGroup[]> {
-        return this.collection.find({ active: true }).toArray();
+        return this.collection.find({ active: true }, { projection: WITHOUT_LAST_RANKING }).toArray();
     }
 
     async create(data: ICreateDomainGroup): Promise<IDomainGroup> {
@@ -60,7 +85,7 @@ export class DomainGroupRepository {
         const result = await this.collection.findOneAndUpdate(
             { slug },
             updateOps,
-            { returnDocument: 'after' }
+            { returnDocument: 'after', projection: WITHOUT_LAST_RANKING }
         );
         return result ?? null;
     }
@@ -77,7 +102,7 @@ export class DomainGroupRepository {
                 $addToSet: { domains: { $each: domains } },
                 $set: { updatedAt: new Date() },
             },
-            { returnDocument: 'after' }
+            { returnDocument: 'after', projection: WITHOUT_LAST_RANKING }
         );
         return result ?? null;
     }
@@ -89,7 +114,7 @@ export class DomainGroupRepository {
                 $pull: { domains: { $in: domains } } as Record<string, unknown>,
                 $set: { updatedAt: new Date() },
             },
-            { returnDocument: 'after' }
+            { returnDocument: 'after', projection: WITHOUT_LAST_RANKING }
         );
         return result ?? null;
     }
