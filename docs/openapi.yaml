@@ -55,7 +55,7 @@ paths:
         1. Match em `Rules` (query params).
         2. Match em `InAppRules` por `utm_campaign` (redirect ou iframe HTML conforme user-agent).
         3. Roteamento por ranking eCPM do grupo `main` (round-robin global ou modo best-RPS por IP — serve o melhor eCPM de cada dominio ainda nao visitado nesta hora —, conforme `bestRpsMode`).
-        4. Fallback: dominio aleatorio + path random.
+        4. Fallback (ranking vazio): home (`https://<dominio>/`) de um dominio aleatorio do grupo. Nunca redireciona para `/random`. No modo best-RPS, quando o IP ja visitou todos os dominios na hora, serve o proximo post real do ranking (rotacionado pelo contador global do grupo).
 
         Sempre repassa todos os query params recebidos para o destino. Defaults UTM (`utm_source=redron`, `utm_medium=broadcast`) sao injetados quando ausentes. Se `?broad=` presente, usa como `utm_campaign` E incrementa `broad_clicks`. Click agregado e gravado no Mongo (fire-and-forget).
 
@@ -1176,7 +1176,7 @@ components:
         domain: { type: string }
         postId:
           type: string
-          description: "ID do post no WP, ou `random` quando dominio sem dados"
+          description: "ID do post no WP. Dominios sem dados nao geram itens no ranking (nunca `random`)."
         ecpm: { type: number, format: float }
         revenue: { type: number, format: float }
         uniqueVisitors:
