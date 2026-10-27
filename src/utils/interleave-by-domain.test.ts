@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { interleaveByDomain, LinkInfo } from './interleave-by-domain';
+import { interleaveByDomain, dropRandomPlaceholders, LinkInfo } from './interleave-by-domain';
 
 function link(domain: string, postId: string, ecpm: number, revenue: number): LinkInfo {
     return { url: `https://${domain}/?p=${postId}`, domain, postId, ecpm, revenue, uniqueVisitors: 0, rps: 0 };
@@ -19,19 +19,14 @@ test('interleaveByDomain: round-robin básico intercala domínios em vez de agru
     ]);
 });
 
-test('interleaveByDomain: domínio sem dados entra como /random no fim de cada rodada', () => {
+test('interleaveByDomain: domínio sem dados não gera slot (sem padding)', () => {
     const ranking: LinkInfo[] = [
         link('a.com', '1', 10, 1),
     ];
     const result = interleaveByDomain(ranking, ['a.com', 'empty.com']);
-    assert.equal(result.length, 2);
+    assert.equal(result.length, 1);
     assert.equal(result[0].domain, 'a.com');
     assert.equal(result[0].postId, '1');
-    assert.equal(result[1].domain, 'empty.com');
-    assert.equal(result[1].postId, 'random');
-    assert.equal(result[1].ecpm, 0);
-    assert.equal(result[1].revenue, 0);
-    assert.match(result[1].url, /^https:\/\/empty\.com\//);
 });
 
 test('interleaveByDomain: empate de eCPM entre domínios desempata pela ordem do ranking recebido (revenue desc), não pela ordem de cadastro', () => {
@@ -60,15 +55,12 @@ test('interleaveByDomain: ordem RPS é preservada (critério-agnóstico — não
     assert.deepEqual(result.map(r => r.domain), ['c.com', 'a.com', 'b.com']);
 });
 
-test('interleaveByDomain: array de ranking vazio produz apenas /random para todos os domínios', () => {
+test('interleaveByDomain: ranking vazio produz resultado vazio', () => {
     const result = interleaveByDomain([], ['a.com', 'b.com']);
-    assert.equal(result.length, 2);
-    assert.ok(result.every(r => r.postId === 'random'));
+    assert.deepEqual(result, []);
 });
 
-test('interleaveByDomain: domínio que esgota antes dos outros vira /random na rodada seguinte', () => {
-    // a.com tem 2 links, b.com tem 1 — na rodada 1 (índice 1) b.com já esgotou e deve virar
-    // /random, não sumir do resultado nem repetir o último link real.
+test('interleaveByDomain: domínio que esgota antes dos outros é pulado nas rodadas seguintes', () => {
     const ranking: LinkInfo[] = [
         link('a.com', '1', 10, 1),
         link('a.com', '2', 5, 1),
@@ -76,6 +68,46 @@ test('interleaveByDomain: domínio que esgota antes dos outros vira /random na r
     ];
     const result = interleaveByDomain(ranking, ['a.com', 'b.com']);
     assert.deepEqual(result.map(r => `${r.domain}:${r.postId}`), [
-        'a.com:1', 'b.com:1', 'a.com:2', 'b.com:random',
+        'a.com:1', 'b.com:1', 'a.com:2',
     ]);
+});
+
+test('interleaveByDomain: domínios com quantidades diferentes de links (3/1/2)', () => {
+    const ranking: LinkInfo[] = [
+        link('a.com', '1', 10, 1),
+        link('a.com', '2', 9, 1),
+        link('b.com', '1', 8, 1),
+        link('c.com', '1', 7, 1),
+        link('a.com', '3', 6, 1),
+        link('c.com', '2', 5, 1),
+    ];
+    const result = interleaveByDomain(ranking, ['a.com', 'b.com', 'c.com', 'empty.com']);
+    assert.deepEqual(result.map(r => `${r.domain}:${r.postId}`), [
+        'a.com:1', 'b.com:1', 'c.com:1',
+        'a.com:2', 'c.com:2',
+        'a.com:3',
+    ]);
+});
+
+test('interleaveByDomain: nunca emite item random nem URL /random', () => {
+    const ranking: LinkInfo[] = [
+        link('a.com', '1', 10, 1),
+        link('b.com', '1', 8, 1),
+        link('b.com', '2', 7, 1),
+    ];
+    for (const all of [['a.com', 'b.com'], ['a.com', 'b.com', 'x.com', 'y.com'], []]) {
+        const result = interleaveByDomain(ranking, all);
+        assert.ok(result.every(r => r.postId !== 'random' && !r.url.includes('/random')));
+    }
+    assert.ok(interleaveByDomain([], ['a.com']).every(r => r.postId !== 'random'));
+});
+
+test('dropRandomPlaceholders: remove itens random legados e preserva a ordem dos reais', () => {
+    const ranking: LinkInfo[] = [
+        link('a.com', '1', 10, 1),
+        { ...link('es.com', 'random', 0, 0), url: 'https://es.com/random' },
+        link('a.com', '2', 5, 1),
+    ];
+    assert.deepEqual(dropRandomPlaceholders(ranking).map(r => r.postId), ['1', '2']);
+    assert.deepEqual(dropRandomPlaceholders([{ ...link('x.com', 'random', 0, 0) }]), []);
 });

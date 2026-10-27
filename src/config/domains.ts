@@ -51,7 +51,3 @@ export function getRandomFallbackDomain(): string | null {
     const randomIndex = Math.floor(Math.random() * activeDomains.length);
     return activeDomains[randomIndex].url;
 }
-
-export function generateRandomPath(): string {
-    return `/random`;
-}

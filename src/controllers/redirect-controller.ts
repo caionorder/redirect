@@ -9,13 +9,13 @@ import { RedirectClickRepository } from '../repositories/redirect-click-reposito
 import { BroadClickRepository } from '../repositories/broad-click-repository';
 import { IFilterRequest } from '../interfaces/filter-interfaces';
 import { redis } from '../config/redis';
-import { generateRandomPath } from '../config/domains';
 import { DomainGroupService } from '../services/domain-group-service';
 import { isExplorationRequest, decideServingSource } from '../utils/exploration-math';
 import { normalizeGamDomain } from '../utils/domain-normalize';
 import { PageviewService } from '../services/pageview-service';
 import { computeRps, sortRpsWithEcpmFallback, RpsRankable } from '../utils/rps-ranking';
-import { interleaveByDomain, LinkInfo, RankedLinksList } from '../utils/interleave-by-domain';
+import { interleaveByDomain, dropRandomPlaceholders, LinkInfo, RankedLinksList } from '../utils/interleave-by-domain';
+import { pickExhaustedLink } from '../utils/exhausted-link';
 import { buildFixedPathUrl, buildFixedPathLinkId, pickFixedPathDomain, resolveEffectiveFixedPath } from '../utils/fixed-path';
 
 /**
@@ -335,7 +335,7 @@ export class RedirectController {
         // mais abaixo, sem uma segunda chamada.
         const groupConfig = await this.domainGroupService.getGroupConfig(slug);
 
-        // Validar posts via API WordPress ANTES de intercalar (senão /random seria removido) e
+        // Validar posts via API WordPress ANTES de intercalar e
         // ANTES do ranking por RPS abaixo — não faz sentido pagar chamada de pageview para um
         // post que a validação WP vai descartar em seguida.
         const { ranking: validatedRanking, validPostsMap } = await this.validateRanking(limitedRanking);
@@ -382,7 +382,7 @@ export class RedirectController {
             console.log(`[CRON-${slug.toUpperCase()}] RPS mode: ${uniquesMap.size}/${validatedRanking.length} uniques obtidos, ${validRpsCount} itens com RPS válido (>=${this.MIN_UNIQUES_FOR_RPS} uniques), fallback eCPM para ${validatedRanking.length - validRpsCount}`);
         }
 
-        // Intercalar domínios (round-robin) — domínios sem dados entram como /random
+        // Intercalar domínios (round-robin) — domínios sem dados não geram slot
         const interleavedRanking = interleaveByDomain(validatedRanking, groupDomains);
 
         const topRanking = interleavedRanking.slice(0, 50);
@@ -445,8 +445,8 @@ export class RedirectController {
      * de `EXPLORATION_POOL_CAP` itens.
      *
      * Universo de domínios é `groupDomains` (TODO o grupo), não só os que monetizaram hoje —
-     * senão um domínio novo/sem receita nunca ganharia exploração de post, só o `/random` do
-     * `interleaveByDomain`, o que deixaria o loop de retroalimentação fechado no eixo domínio.
+     * senão um domínio novo/sem receita nunca ganharia exploração de post, nenhum post do
+     * ranking, o que deixaria o loop de retroalimentação fechado no eixo domínio.
      *
      * Custo de rede: domínios em `domainsValidatedThisCycle` (já tentados por `validateRanking`
      * neste ciclo, saudáveis ou não) reaproveitam `validPostsMapFromRanking` — zero chamadas WP
@@ -892,7 +892,8 @@ export class RedirectController {
      * or RPS-with-eCPM-fallback in `bestRpsMode` groups — see `RedirectController.executeProcessForGroup`),
      * round 1 the second-best, etc. Iterating it in order and returning the first unvisited
      * domain therefore serves the best item of each domain the user hasn't seen this hour.
-     * Falls back to random if all domains are exhausted.
+     * If all domains are exhausted for this IP, serves the NEXT real ranking post, rotating by the
+     * slug's global visit counter (never the random route).
      * Naming (`bestrps_*`, `BEST_RPS`, this function name) is frozen: linkIds are the key used
      * by redirects_clicks for click attribution — do not rename, regardless of which ranking
      * criterion is active for the group.
@@ -901,7 +902,7 @@ export class RedirectController {
         clientIp: string,
         slug: string,
         ranking: RankedLinksList,
-        groupDomains: string[]
+        visitIndex: number
     ): Promise<{ url: string; domain: string; linkId: string; logType: string }> {
         const visitorKey = this.getVisitorKey(clientIp, slug);
 
@@ -944,12 +945,17 @@ export class RedirectController {
             }
         }
 
-        // All domains exhausted — pick random domain with /random path
-        const randomDomain = groupDomains[Math.floor(Math.random() * groupDomains.length)];
+        // All domains exhausted — serve the next real ranking post (rotating by the global visit
+        // counter). Not marked as visited: everything already is. Same click-attribution family as the
+        // bestrps_* linkIds (suffix `<domain>_<postId>`).
+        const picked = pickExhaustedLink(ranking, visitIndex);
+        // Callers guarantee a non-empty ranking; if this ever throws, it falls into the handler's catch
+        // (500 JSON in redirectByGroup, https://useuapp.com/ in redirect()).
+        if (!picked) throw new Error(`[BEST_RPS] empty ranking for group '${slug}'`);
         return {
-            url: `https://${randomDomain}${generateRandomPath()}`,
-            domain: randomDomain,
-            linkId: `bestrps_exhausted_${slug}_${randomDomain}`,
+            url: picked.link.url,
+            domain: picked.link.domain,
+            linkId: `bestrps_exhausted_${slug}_${picked.link.domain}_${picked.link.postId}`,
             logType: `BEST_RPS EXHAUSTED ${slug.toUpperCase()}`
         };
     }
@@ -1027,7 +1033,9 @@ export class RedirectController {
             const redisKey = this.getRedisKeyForGroup(slug);
             const redisData = await this.redisClient.get(redisKey);
             if (redisData) {
-                const parsed = JSON.parse(redisData) as RankedLinksList;
+                // Defesa contra ranking legado com itens `random` (salvo antes desta regra).
+                const parsed = dropRandomPlaceholders(JSON.parse(redisData) as RankedLinksList);
+                if (parsed.length === 0) return null;
                 this.bestLinksMapCaches.set(slug, { data: parsed, time: now });
                 return parsed;
             }
@@ -1057,7 +1065,8 @@ export class RedirectController {
             const redisKey = this.getRedisKeyForExplorationPool(slug);
             const redisData = await this.redisClient.get(redisKey);
             if (redisData) {
-                const parsed = JSON.parse(redisData) as RankedLinksList;
+                const parsed = dropRandomPlaceholders(JSON.parse(redisData) as RankedLinksList);
+                if (parsed.length === 0) return null;
                 this.explorationPoolCaches.set(slug, { data: parsed, time: now });
                 return parsed;
             }
@@ -1378,8 +1387,9 @@ export class RedirectController {
     /**
      * Redirect principal com nova logica:
      * - Rotaciona dominios sequencialmente
-     * - Se visitante ja viu o dominio naquela hora -> /random
+     * - Se visitante ja viu todos os dominios naquela hora -> proximo post real do ranking (bestRps)
      * - Se primeira visita -> melhor link do dominio
+     * - Sem ranking -> home de um dominio do grupo (nunca a rota random)
      */
     public async redirect(req: Request, res: Response): Promise<void> {
         try {
@@ -1482,8 +1492,7 @@ export class RedirectController {
                         this.addVisitedDomain(clientIp, 'main', domain).catch(() => {});
                     }
                 } else if (mainConfig?.bestRpsMode) {
-                    const mainDomains = await this.domainGroupService.getDomains('main');
-                    const bestRps = await this.getBestRpsLink(clientIp, 'main', globalRanking, mainDomains);
+                    const bestRps = await this.getBestRpsLink(clientIp, 'main', globalRanking, visitIndex);
                     redirectUrl = bestRps.url;
                     domain = bestRps.domain;
                     linkId = bestRps.linkId;
@@ -1500,12 +1509,12 @@ export class RedirectController {
                     logType = `RANK #${idx + 1}`;
                 }
             } else {
-                // Sem dados de ranking -> dominio aleatorio + /random
+                // Sem dados de ranking -> home de um dominio aleatorio do grupo
                 const mainDomains = await this.domainGroupService.getDomains('main');
                 domain = mainDomains[Math.floor(Math.random() * mainDomains.length)];
-                redirectUrl = `https://${domain}${generateRandomPath()}`;
+                redirectUrl = `https://${domain}/`;
                 linkId = `fallback_${domain}`;
-                logType = 'RANDOM LINK';
+                logType = 'HOME FALLBACK';
                 if (RedirectController.DEBUG_REDIRECT) console.log(`[DEBUG] ranking global está VAZIO - rode /api/process para popular`);
             }
 
@@ -1580,13 +1589,13 @@ export class RedirectController {
         } catch (error) {
             console.error('Error in redirect:', error);
             res.setHeader('Cache-Control', 'private, no-store');
-            res.redirect('https://useuapp.com/random');
+            res.redirect('https://useuapp.com/');
         }
     }
 
     /**
      * Redirect generico para qualquer grupo de dominios (rotas dinamicas).
-     * Usa ranking eCPM do grupo, com fallback para dominio aleatorio + /random.
+     * Usa ranking eCPM do grupo, com fallback para a home de um dominio aleatorio do grupo.
      */
     public async redirectByGroup(req: Request, res: Response, slug: string): Promise<void> {
         try {
@@ -1681,7 +1690,7 @@ export class RedirectController {
                         this.addVisitedDomain(clientIp, slug, domain).catch(() => {});
                     }
                 } else if (groupConfig?.bestRpsMode) {
-                    const bestRps = await this.getBestRpsLink(clientIp, slug, globalRanking, groupDomains);
+                    const bestRps = await this.getBestRpsLink(clientIp, slug, globalRanking, visitIndex);
                     redirectUrl = bestRps.url;
                     domain = bestRps.domain;
                     linkId = bestRps.linkId;
@@ -1698,11 +1707,11 @@ export class RedirectController {
                     logType = `RANK #${idx + 1} ${slug.toUpperCase()}`;
                 }
             } else {
-                // Sem dados de ranking -> dominio aleatorio + /random
+                // Sem dados de ranking -> home de um dominio aleatorio do grupo
                 domain = groupDomains[Math.floor(Math.random() * groupDomains.length)];
-                redirectUrl = `https://${domain}${generateRandomPath()}`;
+                redirectUrl = `https://${domain}/`;
                 linkId = `fallback_${slug}_${domain}`;
-                logType = `RANDOM LINK ${slug.toUpperCase()}`;
+                logType = `HOME FALLBACK ${slug.toUpperCase()}`;
                 if (RedirectController.DEBUG_REDIRECT) console.log(`[DEBUG-${slug.toUpperCase()}] ranking global está VAZIO - rode /api/process para popular`);
             }
 
