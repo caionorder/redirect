@@ -1,6 +1,7 @@
 import { Db } from 'mongodb';
 import { DomainGroupRepository } from '../repositories/domain-group-repository';
 import { IDomainGroup, ICreateDomainGroup } from '../schemas/domain-group-schema';
+import { RankedLinksList } from '../utils/interleave-by-domain';
 import { domains as seedDomains, domains_db as seedDomainsDb } from '../config/domains';
 
 export class DomainGroupService {
@@ -158,6 +159,16 @@ export class DomainGroupService {
     async getAllGroups(): Promise<IDomainGroup[]> {
         await this.ensureCache();
         return this.allGroupsCache;
+    }
+
+    /** Persiste o último ranking válido do grupo no Mongo (ver DomainGroupRepository.saveLastRanking). */
+    async saveLastRanking(slug: string, ranking: RankedLinksList): Promise<void> {
+        await this.repository.saveLastRanking(slug, ranking);
+    }
+
+    /** Último ranking persistido do grupo (ou null se nunca houve). Não passa pelo cache de config. */
+    async getLastRanking(slug: string): Promise<{ ranking: RankedLinksList; at: Date | null } | null> {
+        return this.repository.findLastRanking(slug);
     }
 
     /**

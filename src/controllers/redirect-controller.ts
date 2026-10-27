@@ -16,6 +16,9 @@ import { PageviewService } from '../services/pageview-service';
 import { computeRps, sortRpsWithEcpmFallback, RpsRankable } from '../utils/rps-ranking';
 import { interleaveByDomain, dropRandomPlaceholders, LinkInfo, RankedLinksList } from '../utils/interleave-by-domain';
 import { pickExhaustedLink } from '../utils/exhausted-link';
+import { formatDateInTz, lookbackDates } from '../utils/date-lookback';
+import { pickFirstUsableDay } from '../utils/ranking-lookback';
+import { RankingResolver, RANKING_MEMORY_TTL_MS } from '../utils/ranking-fallback';
 import { buildFixedPathUrl, buildFixedPathLinkId, pickFixedPathDomain, resolveEffectiveFixedPath } from '../utils/fixed-path';
 
 /**
@@ -93,11 +96,15 @@ export class RedirectController {
     // Chave Redis para regras de in-app
     private readonly INAPP_RULES_KEY = 'redirect:inapp_rules';
 
-    // Cache genérico por slug: { data: RankedLinksList, time: number }
-    private bestLinksMapCaches: Map<string, { data: RankedLinksList; time: number }> = new Map();
-    private readonly CACHE_TTL_MS = 60000; // 1 minuto de cache em memória
+    // Cadeia de serving do ranking por slug: cache em memória -> Redis -> lastRanking do Mongo
+    // (ver utils/ranking-fallback.ts). Criado no constructor, pois depende do service/redis.
+    private rankingResolver: RankingResolver;
+    private readonly CACHE_TTL_MS = RANKING_MEMORY_TTL_MS; // cache em memória (também usado nos demais caches)
 
-    // Cache em memória do pool de exploração por slug (mesmo padrão de bestLinksMapCaches)
+    // Impressões mínimas para um post entrar no ranking (abaixo disso é ruído estatístico).
+    private readonly MIN_IMPRESSIONS_FOR_RANKING = 100;
+
+    // Cache em memória do pool de exploração por slug (mesmo padrão de cache em memória do RankingResolver)
     private explorationPoolCaches: Map<string, { data: RankedLinksList; time: number }> = new Map();
 
     // 1 a cada N requests (1/N do tráfego) vai para o pool de exploração em vez do ranking/bestRps
@@ -148,6 +155,19 @@ export class RedirectController {
         this.redisClient = redis;
         this.domainGroupService = DomainGroupService.getInstance(db);
         this.pageviewService = new PageviewService();
+        this.rankingResolver = new RankingResolver({
+            getRedis: (slug) => {
+                // Sem Redis é tratado como indisponível: o resolver cai no Mongo.
+                if (!this.redisClient) return Promise.reject(new Error('Redis client not configured'));
+                return this.redisClient.get(this.getRedisKeyForGroup(slug));
+            },
+            loadMongo: (slug) => this.domainGroupService.getLastRanking(slug),
+            // NX: nunca sobrescreve um ranking fresco que o cron gravou no meio-tempo.
+            seedRedis: async (slug, ranking) => {
+                await this.redisClient?.set(this.getRedisKeyForGroup(slug), JSON.stringify(ranking), 'EX', 3600, 'NX');
+            },
+            now: () => Date.now(),
+        });
 
         if (db) {
             this.gamAdUnitRepository = new GamAdUnitRepository(db);
@@ -242,31 +262,44 @@ export class RedirectController {
 
         // Data de hoje no fuso America/Sao_Paulo — bate com o `date` gravado pelo ETL.
         // Sem isso, em servidor UTC, das 21h-00h BRT a query erra o dia.
-        const todayStr = new Intl.DateTimeFormat('en-CA', {
-            timeZone: 'America/Sao_Paulo',
-            year: 'numeric', month: '2-digit', day: '2-digit'
-        }).format(new Date());
-
-        // Desde 05-08/08/2026 o GAM passou a retornar o domain do ETL com underscore(s) final(is)
-        // após um rename de ad units (ex.: `dopeaaps.com_`) — a query precisa casar as duas
-        // formas, senão os domínios afetados somem do resultado inteiro. Normalização do valor
-        // de volta acontece no loop abaixo, antes de qualquer uso (ver normalizeGamDomain).
-        const filterRequest: IFilterRequest = {
-            start: todayStr,
-            end: todayStr,
-            domain: [...groupDomains, ...groupDomains.map(d => `${d}_`)],
-            custom_key: "id_post_wp",
-            group: ["domain", "custom_key", "custom_value"]
-        };
+        const todayStr = formatDateInTz(new Date());
 
         if (!this.gamAdUnitRepository) {
             throw new Error('Database not connected');
         }
 
-        const data = await this.superFilterService.execute(filterRequest, this.gamAdUnitRepository);
+        // Desde 05-08/08/2026 o GAM passou a retornar o domain do ETL com underscore(s) final(is)
+        // após um rename de ad units (ex.: `dopeaaps.com_`) — a query precisa casar as duas
+        // formas, senão os domínios afetados somem do resultado inteiro. Normalização do valor
+        // de volta acontece no loop abaixo, antes de qualquer uso (ver normalizeGamDomain).
+        const queryDomains = [...groupDomains, ...groupDomains.map(d => `${d}_`)];
 
-        if (!Array.isArray(data) || data.length === 0) {
-            console.log(`[CRON-${slug.toUpperCase()}] Nenhum dado encontrado para processar`);
+        // Lookback: logo após a virada do dia (ou num deploy às 00h, com o Redis zerado) o GAM/ETL
+        // ainda não tem linhas de hoje. Tenta hoje, depois ontem... até 3 dias atrás; o primeiro dia
+        // COM dados utilizáveis vence. "Utilizável" = ao menos um post acima do piso de impressões
+        // (senão um punhado de linhas pequenas de hoje esvaziaria o ranking e o serving cairia na home).
+        const candidateDates = lookbackDates(todayStr);
+        const picked = await pickFirstUsableDay(
+            candidateDates,
+            (dateStr) => this.superFilterService.execute({
+                start: dateStr,
+                end: dateStr,
+                domain: queryDomains,
+                custom_key: "id_post_wp",
+                group: ["domain", "custom_key", "custom_value"]
+            } as IFilterRequest, this.gamAdUnitRepository!),
+            (rows) => Array.isArray(rows) && rows.some(item =>
+                item.domain && item.custom_value && Number(item.impressions || 0) >= this.MIN_IMPRESSIONS_FOR_RANKING
+            )
+        );
+        const data = picked && Array.isArray(picked.rows) ? picked.rows : [];
+        const dataDateStr = picked?.date ?? todayStr;
+        if (picked && picked.lookbackDays > 0) {
+            console.log(`[CRON-${slug.toUpperCase()}] Sem dados GAM para ${todayStr}; usando ${picked.date} (lookback ${picked.lookbackDays} dia(s))`);
+        }
+
+        if (data.length === 0) {
+            console.log(`[CRON-${slug.toUpperCase()}] Nenhum dado encontrado para processar (${todayStr} e ${candidateDates.length - 1} dias anteriores)`);
             return null;
         }
 
@@ -283,7 +316,7 @@ export class RedirectController {
             if (!item.domain || !item.custom_value) continue;
 
             const impressions = Number(item.impressions || 0);
-            if (impressions < 100) {
+            if (impressions < this.MIN_IMPRESSIONS_FOR_RANKING) {
                 skipped++;
                 continue;
             }
@@ -359,7 +392,7 @@ export class RedirectController {
         if (groupConfig?.bestRpsMode) {
             const uniquesMap = await this.pageviewService.fetchBulkUniques(
                 validatedRanking.map(item => ({ domain: item.domain, postId: item.postId })),
-                todayStr,
+                dataDateStr,
                 this.RPS_UNIQUES_CONCURRENCY
             );
 
@@ -390,13 +423,29 @@ export class RedirectController {
         // Salvar no cache Redis (1 hora)
         const redisKey = this.getRedisKeyForGroup(slug);
         if (this.redisClient) {
-            await this.redisClient.set(
-                redisKey,
-                JSON.stringify(topRanking),
-                'EX',
-                3600
-            );
-            console.log(`[CRON-${slug.toUpperCase()}] Ranking global atualizado: ${topRanking.length} links no rank (${validatedRanking.length} validados, ${skipped} ignorados por <100 impressões)`);
+            try {
+                await this.redisClient.set(
+                    redisKey,
+                    JSON.stringify(topRanking),
+                    'EX',
+                    3600
+                );
+                console.log(`[CRON-${slug.toUpperCase()}] Ranking global atualizado: ${topRanking.length} links no rank (${validatedRanking.length} validados, ${skipped} ignorados por <${this.MIN_IMPRESSIONS_FOR_RANKING} impressões)`);
+            } catch (err) {
+                // Isolado para que a persistência no Mongo (abaixo) rode mesmo com o SET falhando.
+                console.error(`[CRON-${slug.toUpperCase()}] Erro ao salvar ranking no Redis:`, err);
+            }
+        }
+
+        // Persistir o último ranking válido no Mongo: sobrevive ao wipe do Redis num deploy, para o
+        // serving nunca ficar sem post real enquanto o GAM ainda não tem dados. Roda mesmo se o SET do
+        // Redis acima falhou (try/catch próprio); a falha do próprio Mongo só loga.
+        if (topRanking.length > 0) {
+            try {
+                await this.domainGroupService.saveLastRanking(slug, topRanking);
+            } catch (err) {
+                console.error(`[CRON-${slug.toUpperCase()}] Erro ao persistir lastRanking no Mongo:`, err);
+            }
         }
 
         // Log do top 5 — inclui RPS/uniques quando o grupo está em modo RPS
@@ -1016,34 +1065,10 @@ export class RedirectController {
     }
 
     /**
-     * Obtem o ranking de melhores links de um grupo pelo slug (com cache em memória + Redis)
+     * Obtem o ranking de melhores links de um grupo pelo slug (cache em memória -> Redis -> lastRanking do Mongo; ver RankingResolver)
      */
     private async getBestLinksMapForGroup(slug: string): Promise<RankedLinksList | null> {
-        try {
-            const now = Date.now();
-            const cached = this.bestLinksMapCaches.get(slug);
-
-            // Verificar cache em memória primeiro
-            if (cached && (now - cached.time) < this.CACHE_TTL_MS) {
-                return cached.data;
-            }
-
-            if (!this.redisClient) return cached?.data || null;
-
-            const redisKey = this.getRedisKeyForGroup(slug);
-            const redisData = await this.redisClient.get(redisKey);
-            if (redisData) {
-                // Defesa contra ranking legado com itens `random` (salvo antes desta regra).
-                const parsed = dropRandomPlaceholders(JSON.parse(redisData) as RankedLinksList);
-                if (parsed.length === 0) return null;
-                this.bestLinksMapCaches.set(slug, { data: parsed, time: now });
-                return parsed;
-            }
-            return cached?.data || null;
-        } catch (error) {
-            console.error(`Error getting best links map for group ${slug}:`, error);
-            return this.bestLinksMapCaches.get(slug)?.data || null;
-        }
+        return this.rankingResolver.get(slug);
     }
 
     /**
